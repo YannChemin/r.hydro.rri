@@ -1,0 +1,177 @@
+<h2>DESCRIPTION</h2>
+
+<em>r.hydro.rri</em> prepares model inputs for RRI (Rainfall-Runoff-Inundation),
+a fully-distributed rainfall-runoff/flood-inundation model, from GRASS
+rasters and space-time raster datasets (STRDS), and optionally runs the
+model and imports its outlet hydrograph back into GRASS.
+
+<p>
+RRI itself is not a GRASS module -- it is a separate C engine
+(<tt>RRI.opencl</tt>, at <tt>$HOME/dev/RRI.opencl</tt>, built from
+<tt>RRI_1.4.2.7_Linux</tt>) with its own text-file/ESRI-ASCII-grid input
+format (<tt>RRI_Input.txt</tt>/<tt>topo/*.txt</tt>/<tt>rain/rain.dat</tt>).
+<em>r.hydro.rri</em> is a GIS data-preparation bridge: it exports
+<b>elevation</b>, derives flow <b>direction</b>/<b>accumulation</b> (via
+<em>r.watershed</em>) when not supplied, and converts a precipitation
+(and optionally potential evapotranspiration) <b>STRDS</b> -- for
+example, <tt>t.in.era5</tt>'s <tt>&lt;prefix&gt;_precipitation</tt> --
+into RRI's own per-timestep grid format. With the <b>-r</b> flag it also
+invokes the compiled <tt>rri_cpu</tt> binary and imports the resulting
+outlet hydrograph into a GRASS DB table.
+
+<h3>Satellite/reanalysis forcing</h3>
+
+<b>rain_strds</b> is expected to come from a reanalysis or
+satellite-derived precipitation product already imported as a GRASS
+STRDS -- <em>t.in.era5</em>'s <tt>precipitation</tt> variable is the
+primary target (its daily mm/d output matches <tt>rain_units=mm_per_day</tt>,
+the default). Any other STRDS with the same interval-registered (start,
+end) structure works too, including one built from
+<em>r.in.sentinel</em>/<em>r.in.modis</em>/<em>r.in.landsat</em> derived
+products or registered manually with <em>t.register</em>.
+<b>pet_strds</b> follows the same pattern for potential
+evapotranspiration, e.g. <em>t.in.era5</em>'s <tt>potential_evaporation</tt>
+output, or a series of <em>i.evapo.pm</em>/<em>i.evapo.pt</em>/
+<em>i.evapo.mh</em> outputs registered into a STRDS.
+
+<p>
+Every map in a forcing STRDS must be registered as an <b>interval</b> (an
+explicit start AND end time), not an instantaneous point -- RRI's
+rain/PET file format is a step function of elapsed time and needs both.
+A STRDS built by <em>t.in.era5</em> already satisfies this.
+
+<h3>RRI-side simplifications</h3>
+
+<ul>
+<li>Single land-use class only (<tt>num_of_landuse=1</tt>) -- the
+<b>landuse</b> option, if given, is exported for RRI's own internal use,
+but this module's <tt>ns_slope=</tt>/<tt>soildepth=</tt>/etc. options
+apply the <em>same</em> scalar value to the whole domain rather than one
+value per class. See "Known gaps" below.</li>
+<li>River channel geometry (width/depth/height) is not exported; RRI's
+own internal power-law estimate from flow accumulation is used instead
+(<tt>rivfile_switch=0</tt> in the generated <tt>RRI_Input.txt</tt>).</li>
+<li>The model's own D8 flow-direction convention differs from
+<em>r.watershed</em>'s <tt>drainage</tt> output -- see NOTES.</li>
+</ul>
+
+<h2>NOTES</h2>
+
+<h3>Flow direction convention</h3>
+
+<em>r.watershed</em>'s <tt>drainage</tt> output numbers 8 directions
+counter-clockwise from 1=north-east (<tt>r.watershed.md</tt>); RRI's own
+<tt>dir</tt> grid instead uses an 8-bit D8 bitmask (east=1, doubling
+clockwise: E=1, SE=2, S=4, SW=8, W=16, NW=32, N=64, NE=128 -- documented
+in prose only in <tt>RRI_Break.f90</tt>'s comment block).
+<em>r.hydro.rri</em> reclasses one into the other. This mapping has been
+smoke-tested (see <tt>tests/</tt>) but not cross-validated against a real
+watershed with known flow paths -- treat it as a reasonable, documented
+judgment call, not a verified-against-ground-truth conversion.
+
+<p>
+A cell whose flow leaves the computational region gets a <em>negative</em>
+<tt>drainage</tt> value from <em>r.watershed</em>; such cells become RRI
+outlet cells (<tt>dir=0</tt>). <em>r.watershed</em>'s <tt>accumulation</tt>
+output separately uses a negative sign to flag a per-cell reliability
+caveat (not a direction) -- this module always exports
+<tt>abs(accumulation)</tt>, since RRI only ever compares accumulation's
+magnitude against <b>riv_thresh</b>.
+
+<h3>Outlet/hydrograph station</h3>
+
+<em>r.hydro.rri</em> auto-places a single hydrograph station, named
+<tt>outlet</tt>, at the accumulation raster's maximum-magnitude cell.
+This is a reasonable default for a single-outlet watershed but is wrong
+for a domain with more than one drainage outlet (e.g. a delta) -- not
+handled by this module.
+
+<h3>Rain/PET file format</h3>
+
+RRI's <tt>rain.dat</tt>/PET file is a sequence of timestep blocks: a
+header line <tt>t nx ny</tt> (<tt>t</tt> = elapsed seconds since the
+forcing series' own first map's start) followed by <tt>ny</tt> rows of
+<tt>nx</tt> whitespace-separated values in mm/h, preceded by a
+<tt>t=0</tt> all-zero block (used only as the lower bound of RRI's own
+internal time-interpolation search, never applied itself). Values are
+converted from <tt>rain_units=</tt>/<tt>pet_units=</tt> to mm/h before
+writing. The forcing grid's own georeference is written into
+<tt>RRI_Input.txt</tt>'s <tt>xllcorner_rain</tt>/etc. fields -- it does
+not need to align with <b>elevation</b>'s grid; RRI does its own
+nearest-cell lookup at runtime.
+
+<h2>KNOWN GAPS</h2>
+
+<ul>
+<li>Single land-use class only; multi-class per-cell parameterization is
+not implemented.</li>
+<li>River width/depth/height override rasters, dam operation, flow
+diversion, and boundary-condition files (all separate RRI features) are
+not exposed by this module.</li>
+<li><b>final_storage</b> (importing RRI's periodic per-cell output grids
+back as a GRASS raster) is not yet implemented -- RRI's
+<tt>out/hs_*</tt>/<tt>out/hr_*</tt> files are per-cell-index dumps in the
+model's own compressed indexing, not directly re-importable as a full
+grid; wiring this up needs a small reprojection step not built in this
+pass.</li>
+<li>Only the first hydrograph station's discharge column is imported
+into the output DB table, even if <tt>location.txt</tt> ever listed more
+than one (it currently never does -- see "Outlet/hydrograph station"
+above).</li>
+</ul>
+
+<h2>EXAMPLES</h2>
+
+Prepare RRI inputs from a DEM and an ERA5 precipitation STRDS, without
+running the model:
+
+<div class="code"><pre>
+t.in.era5 variables=precipitation start=2026-01-01 end=2026-01-10 \
+  output_prefix=era5
+r.hydro.rri elevation=dem rain_strds=era5_precipitation \
+  project_dir=/data/rri_project lasth=240
+</pre></div>
+
+Also run the model (OpenMP/CPU backend) and import the outlet hydrograph:
+
+<div class="code"><pre>
+r.hydro.rri elevation=dem rain_strds=era5_precipitation \
+  project_dir=/data/rri_project lasth=240 -r
+</pre></div>
+
+With PET forcing and the GPU/OpenCL backend:
+
+<div class="code"><pre>
+t.in.era5 variables=precipitation,potential_evaporation \
+  start=2026-01-01 end=2026-01-10 output_prefix=era5
+r.hydro.rri elevation=dem rain_strds=era5_precipitation \
+  pet_strds=era5_potential_evaporation \
+  project_dir=/data/rri_project lasth=240 -r -g
+</pre></div>
+
+<h2>SEE ALSO</h2>
+
+<em>
+<a href="i.evapo.mh.html">i.evapo.mh</a>,
+<a href="i.evapo.pm.html">i.evapo.pm</a>,
+<a href="i.evapo.pt.html">i.evapo.pt</a>,
+<a href="r.hydro.hbv.html">r.hydro.hbv</a>,
+<a href="r.hydro.hbv.basins.html">r.hydro.hbv.basins</a>,
+<a href="r.hydro.hbv.forcing.html">r.hydro.hbv.forcing</a>,
+<a href="r.in.landsat.html">r.in.landsat</a>,
+<a href="r.in.modis.html">r.in.modis</a>,
+<a href="r.in.sentinel.html">r.in.sentinel</a>,
+<a href="r.watershed.html">r.watershed</a>,
+<a href="t.in.era5.html">t.in.era5</a>,
+<a href="t.rast.list.html">t.rast.list</a>
+</em>
+
+<p>
+RRI model: T. Sayama et al., "Rainfall-Runoff-Inundation (RRI) Model"
+(<a href="https://github.com/YannChemin/RRI_1.4.2.7_Linux">https://github.com/YannChemin/RRI_1.4.2.7_Linux</a>).
+The C/OpenMP/OpenCL engine this module drives: <tt>$HOME/dev/RRI.opencl</tt>
+(this user's own port, see its README for physics/validation details).
+
+<h2>AUTHORS</h2>
+
+Yann Chemin

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+OBJ.*/
+*.tmp.html
+.pytest_cache/
+.hypothesis/
