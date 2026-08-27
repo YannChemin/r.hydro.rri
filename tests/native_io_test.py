@@ -13,9 +13,10 @@ should build through the normal addon Makefile instead.
 
 import os
 import subprocess
-import sys
 
 import pytest
+
+import grass.script as gs
 
 MODULE_DIR = os.path.join(os.path.dirname(__file__), "..")
 
@@ -147,3 +148,74 @@ def test_rain_read_and_index_matches_raster_mean(session, native_binary):
             got_mean = float(line.split("=")[-1].split()[0])
     assert got_mean is not None, output
     assert abs(got_mean - expected_mean) < 1e-6, (got_mean, expected_mean)
+
+
+def test_rain_strds_resolves_and_indexes_every_timestep(session, native_binary):
+    """Increment 3 (see NATIVE_GRASS_PLAN.md 'Progress'): rain_strds=
+    resolves a STRDS's (map, start, end) list, sorts it chronologically,
+    computes elapsed seconds relative to the series' own first start
+    (RRI's t_rain convention -- a record's timestamp is the END of the
+    interval it applies to), and re-runs the same read+convert+index
+    path increment 2 already validated once per timestep. Still not
+    wired into a time loop -- see the RK45-loop item in
+    NATIVE_GRASS_PLAN.md's next steps."""
+    import datetime
+
+    from grass.tools import Tools
+
+    tools = Tools(session=session)
+    tools.g_region(n=10, s=0, e=10, w=0, res=1)
+    tools.r_mapcalc(
+        expression="dem_native_strds_test = 100.0 - row() * 1.7 - col() * 1.3",
+        overwrite=True,
+    )
+    tools.r_watershed(
+        elevation="dem_native_strds_test",
+        drainage="drain_native_strds_test",
+        accumulation="acc_native_strds_test",
+        flags="s",
+    )
+
+    tools.t_create(
+        output="rain_strds_test", type="strds", temporaltype="absolute",
+        title="x", description="x", overwrite=True,
+    )
+    day_values = [5.0, 10.0, 20.0]
+    lines = []
+    start = datetime.date(2026, 1, 1)
+    for i, v in enumerate(day_values):
+        name = f"rain_strds_test_d{i}"
+        tools.r_mapcalc(expression=f"{name} = {v}", overwrite=True)
+        d0 = start + datetime.timedelta(days=i)
+        d1 = d0 + datetime.timedelta(days=1)
+        lines.append(f"{name}|{d0.isoformat()}|{d1.isoformat()}")
+    register_file = gs.tempfile(env=session.env)
+    with open(register_file, "w") as f:
+        f.write("\n".join(lines))
+    gs.run_command(
+        "t.register", input="rain_strds_test", type="raster",
+        file=register_file, env=session.env,
+    )
+
+    result = subprocess.run(
+        [
+            native_binary,
+            "elevation=dem_native_strds_test",
+            "drainage=drain_native_strds_test",
+            "accumulation=acc_native_strds_test",
+            "riv_thresh=5",
+            "rain_strds=rain_strds_test",
+            "--v",
+        ],
+        env=session.env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    output = result.stdout + result.stderr
+
+    assert "rain_strds: resolved 3 timestep(s)" in output, output
+    for i, (v, expected_elapsed) in enumerate(zip(day_values, [86400, 172800, 259200])):
+        expected = f"rain_strds[{i}]: map=rain_strds_test_d{i} elapsed_s={expected_elapsed}"
+        assert expected in output.replace("\n", " "), (expected, output)
+        assert f"mean qp_t_idx={v:.6f}" in output.replace("\n", " "), output

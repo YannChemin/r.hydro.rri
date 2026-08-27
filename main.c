@@ -28,15 +28,152 @@
  *
  *****************************************************************************/
 
+/* popen/pclose, strptime, timegm are POSIX/BSD extensions, not strict
+ * ISO C11 -- needed for resolve_strds_steps' t.rast.list shell-out and
+ * UTC date parsing. Must be defined before any system header is
+ * included (glibc feature-test-macro convention). */
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
+
 #include <grass/gis.h>
 #include <grass/glocale.h>
 #include <grass/raster.h>
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "rri/rri.h"
+
+/* One resolved timestep of a forcing STRDS: the raster map to read and
+ * its elapsed seconds since the series' own first map's start -- same
+ * convention as RRI.f90's t_rain (a record's timestamp is the END of
+ * the interval it applies to; see rri_slo_ij2idx_rain's caller for how
+ * this is used). */
+typedef struct {
+    char name[GNAME_MAX];
+    double elapsed_s;
+} rri_forcing_step;
+
+/* Runs `t.rast.list input=<strds> columns=name,start_time,end_time
+ * separator=|` via popen and parses its output into a chronologically
+ * sorted array of rri_forcing_step (elapsed seconds relative to the
+ * first entry's own start time). Shelling out to t.rast.list rather
+ * than linking GRASS's temporal C library directly is the (a)/(b)
+ * choice NATIVE_GRASS_PLAN.md section 3 left undecided -- resolved here
+ * as (b) for now: linking libtgis directly from a Module.make build was
+ * not attempted/verified this pass, and t.rast.list is a small, one-time
+ * (not per-timestep) subprocess call, not a per-value ASCII round-trip
+ * of forcing data itself -- the actual rain VALUES still come from
+ * Rast_get_d_row on the resolved map names, never from t.rast.list's
+ * own output. Revisit if this subprocess call ever proves too slow or
+ * fragile for a real pipeline.
+ *
+ * Every entry must be an INTERVAL registration (a real end_time, not an
+ * instantaneous point) -- RRI's forcing model is a step function of
+ * elapsed time and needs both ends; fails loudly (not silently) if any
+ * entry lacks one, matching the same requirement the now-superseded
+ * Python driver's write_forcing_series enforced.
+ *
+ * Returns the number of steps found (>=0), or -1 on failure (already
+ * G_fatal_error'd for anything that should stop the whole run; only
+ * returns -1 for "empty STRDS", left to the caller to decide is fatal).
+ */
+static int resolve_strds_steps(const char *strds, rri_forcing_step **out)
+{
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "t.rast.list input=\"%s\" columns=name,start_time,end_time separator=\"|\" 2>&1",
+             strds);
+    FILE *p = popen(cmd, "r");
+    if (!p) G_fatal_error(_("resolve_strds_steps: popen failed for t.rast.list"));
+
+    typedef struct { char name[GNAME_MAX]; time_t start, end; int has_end; } raw_t;
+    int cap = 16, n = 0;
+    raw_t *raw = G_malloc(cap * sizeof(raw_t));
+
+    char line[1024];
+    int lineno = 0;
+    while (fgets(line, sizeof(line), p)) {
+        lineno++;
+        if (lineno == 1) continue; /* header row: name|start_time|end_time */
+        char name[GNAME_MAX] = {0}, start_s[64] = {0}, end_s[64] = {0};
+        char *a = strtok(line, "|"), *b = a ? strtok(NULL, "|") : NULL,
+             *c = b ? strtok(NULL, "|\n") : NULL;
+        if (!a || !b) continue;
+        snprintf(name, sizeof(name), "%s", a);
+        snprintf(start_s, sizeof(start_s), "%s", b);
+        if (c) snprintf(end_s, sizeof(end_s), "%s", c);
+
+        struct tm tm_start = {0}, tm_end = {0};
+        if (!strptime(start_s, "%Y-%m-%d %H:%M:%S", &tm_start)) continue;
+        if (n == cap) { cap *= 2; raw = G_realloc(raw, cap * sizeof(raw_t)); }
+        snprintf(raw[n].name, sizeof(raw[n].name), "%s", name);
+        raw[n].start = timegm(&tm_start);
+        raw[n].has_end = (end_s[0] != '\0' && strcmp(end_s, "None") != 0 &&
+                           strptime(end_s, "%Y-%m-%d %H:%M:%S", &tm_end) != NULL);
+        raw[n].end = raw[n].has_end ? timegm(&tm_end) : 0;
+        n++;
+    }
+    pclose(p);
+
+    if (n == 0) { G_free(raw); *out = NULL; return -1; }
+
+    for (int i = 0; i < n; i++)
+        if (!raw[i].has_end)
+            G_fatal_error(_("resolve_strds_steps: <%s> in STRDS <%s> is registered as an "
+                             "instant (no end_time), not an interval -- RRI's forcing format "
+                             "needs both; re-register with t.register's 'name|start|end' file "
+                             "format"), raw[i].name, strds);
+
+    /* insertion sort by start time -- n is small (a forcing series'
+     * timestep count, not a per-cell quantity), no need for qsort here */
+    for (int i = 1; i < n; i++) {
+        raw_t key = raw[i];
+        int j = i - 1;
+        while (j >= 0 && raw[j].start > key.start) { raw[j + 1] = raw[j]; j--; }
+        raw[j + 1] = key;
+    }
+
+    time_t t0 = raw[0].start;
+    rri_forcing_step *steps = G_malloc(n * sizeof(rri_forcing_step));
+    for (int i = 0; i < n; i++) {
+        snprintf(steps[i].name, sizeof(steps[i].name), "%s", raw[i].name);
+        steps[i].elapsed_s = difftime(raw[i].end, t0);
+    }
+    G_free(raw);
+    *out = steps;
+    return n;
+}
+
+/* Reads raster_name via Rast_get_d_row into a full ny*nx grid array
+ * (null -> 0.0) and indexes it into slope-idx space via
+ * rri_slo_ij2idx -- the exact path increment 2 validated for a single
+ * static rain= raster (see NATIVE_GRASS_PLAN.md "Progress"), factored
+ * out here so STRDS iteration (increment 3) reuses it unchanged rather
+ * than duplicating it. Caller owns qp_t_idx (size sc->count). */
+static void read_and_index_forcing_raster(const char *raster_name, int ny, int nx,
+                                           const rri_slo_cellset *sc, double *qp_t_idx)
+{
+    const char *mapset = G_find_raster2(raster_name, "");
+    if (!mapset) G_fatal_error(_("Raster map <%s> not found"), raster_name);
+    int fd = Rast_open_old(raster_name, mapset);
+    DCELL *row_buf = G_malloc(nx * sizeof(DCELL));
+    double *grid = G_malloc((size_t)ny * nx * sizeof(double));
+    for (int row = 0; row < ny; row++) {
+        Rast_get_d_row(fd, row_buf, row);
+        for (int col = 0; col < nx; col++)
+            grid[(size_t)row * nx + col] =
+                Rast_is_d_null_value(&row_buf[col]) ? 0.0 : row_buf[col];
+    }
+    Rast_close(fd);
+    G_free(row_buf);
+
+    rri_slo_ij2idx(sc, grid, nx, qp_t_idx);
+    G_free(grid);
+}
 
 /* Single-landuse-class defaults, matching the values the vendored
  * engine's own ASCII-driven main.c/RRI_Input.py used for the validated
@@ -119,7 +256,7 @@ int main(int argc, char *argv[])
 {
     struct GModule *module;
     struct {
-        struct Option *elevation, *drainage, *accumulation, *rain;
+        struct Option *elevation, *drainage, *accumulation, *rain, *rain_strds;
         struct Option *riv_thresh, *width_c, *width_s, *depth_c, *depth_s,
             *height_param, *height_limit;
         struct Option *ns_river, *ns_slope, *soildepth, *gammaa, *ksv,
@@ -277,6 +414,20 @@ int main(int argc, char *argv[])
           "raster into slope-idx space and reports a diagnostic, but does "
           "NOT yet drive the RK45 time loop (not wired up yet either).");
 
+    opt.rain_strds = G_define_standard_option(G_OPT_STRDS_INPUT);
+    opt.rain_strds->key = "rain_strds";
+    opt.rain_strds->required = NO;
+    opt.rain_strds->description =
+        _("Precipitation space-time raster dataset [mm/h per map], "
+          "e.g. t.in.era5's <prefix>_precipitation (converted to mm/h "
+          "first if it's t.in.era5's native mm/day -- this option "
+          "expects mm/h already, unlike rain=). Increment 3 (see "
+          "NATIVE_GRASS_PLAN.md 'Progress'): resolves and iterates the "
+          "series, reporting a per-timestep diagnostic -- NOT YET wired "
+          "into the RK45 time loop (doesn't exist yet either). Mutually "
+          "exclusive with rain= in practice (rain_strds= takes priority "
+          "if both given).");
+
     eight_dir_flag = G_define_flag();
     eight_dir_flag->key = 'e';
     eight_dir_flag->description = _("8-direction hillslope routing (default: 4-direction)");
@@ -418,30 +569,34 @@ int main(int argc, char *argv[])
 
     G_message(_("riv_count=%d slo_count=%d"), rc.count, sc.count);
 
-    /* Forcing input, increment 2 (NATIVE_GRASS_PLAN.md "Progress"):
-     * read a single static rain raster and index it into slope-idx
-     * space, matching what RRI.f90's `qp_t_idx` is at any one instant
-     * inside the time loop -- but the time loop itself (and therefore a
-     * rain_strds= time series, which needs a *sequence* of these) is
-     * NOT wired up yet. This only proves the read+convert+index path is
-     * correct in isolation, via a checkable diagnostic below. */
-    if (opt.rain->answer) {
-        mapset = G_find_raster2(opt.rain->answer, "");
-        if (!mapset) G_fatal_error(_("Raster map <%s> not found"), opt.rain->answer);
-        int fd_rain = Rast_open_old(opt.rain->answer, mapset);
-        DCELL *rain_row = G_malloc(nx * sizeof(DCELL));
-        double *qp_t = G_calloc(ncell, sizeof(double));
-        for (int row = 0; row < ny; row++) {
-            Rast_get_d_row(fd_rain, rain_row, row);
-            for (int col = 0; col < nx; col++)
-                qp_t[(size_t)row * nx + col] =
-                    Rast_is_d_null_value(&rain_row[col]) ? 0.0 : rain_row[col];
-        }
-        Rast_close(fd_rain);
-        G_free(rain_row);
+    /* Forcing input, increment 2 (single raster) and increment 3 (STRDS
+     * time series) -- see NATIVE_GRASS_PLAN.md "Progress". Neither is
+     * wired into a time loop yet (it doesn't exist yet either); both
+     * only prove the read+convert+index path is correct, via a
+     * checkable diagnostic, in isolation and (for the STRDS case) across
+     * a whole resolved series. */
+    if (opt.rain_strds->answer) {
+        rri_forcing_step *steps = NULL;
+        int n_steps = resolve_strds_steps(opt.rain_strds->answer, &steps);
+        if (n_steps < 0)
+            G_fatal_error(_("rain_strds=<%s> has no registered raster maps"),
+                           opt.rain_strds->answer);
+        G_message(_("rain_strds: resolved %d timestep(s)"), n_steps);
 
         double *qp_t_idx = G_malloc(sc.count * sizeof(double));
-        rri_slo_ij2idx(&sc, qp_t, nx, qp_t_idx);
+        for (int i = 0; i < n_steps; i++) {
+            read_and_index_forcing_raster(steps[i].name, ny, nx, &sc, qp_t_idx);
+            double sum = 0.0;
+            for (int k = 0; k < sc.count; k++) sum += qp_t_idx[k];
+            G_message(_("rain_strds[%d]: map=%s elapsed_s=%.0f mean qp_t_idx=%.6f mm/h"),
+                       i, steps[i].name, steps[i].elapsed_s,
+                       sc.count ? sum / sc.count : 0.0);
+        }
+        G_free(qp_t_idx);
+        G_free(steps);
+    } else if (opt.rain->answer) {
+        double *qp_t_idx = G_malloc(sc.count * sizeof(double));
+        read_and_index_forcing_raster(opt.rain->answer, ny, nx, &sc, qp_t_idx);
 
         /* Diagnostic: mean of qp_t_idx over active slope cells should
          * equal the raster's own mean over in-domain cells (a uniform
@@ -452,7 +607,6 @@ int main(int argc, char *argv[])
         for (int k = 0; k < sc.count; k++) sum += qp_t_idx[k];
         G_message(_("rain: mean qp_t_idx over %d active slope cells = %.6f mm/h"),
                    sc.count, sc.count ? sum / sc.count : 0.0);
-        G_free(qp_t);
         G_free(qp_t_idx);
     }
 

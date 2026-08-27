@@ -108,17 +108,39 @@ broken index mapping as long as the cell *count* happened to be right
 `tests/native_io_test.py::test_rain_read_and_index_matches_raster_mean`
 (6/6 tests passing overall now).
 
+**Increment 3 implemented and validated**: `rain_strds=` resolves a
+STRDS's `(map, start_time, end_time)` list by shelling to `t.rast.list`
+(§3's (a)/(b) choice resolved as (b): linking `libtgis` directly from a
+`Module.make` build was not attempted this pass -- `t.rast.list` is a
+small, once-per-run subprocess call, not a per-timestep or per-value
+ASCII round-trip, so it doesn't reintroduce the "no ASCII files"
+violation this rewrite exists to fix; actual rain VALUES still come
+only from `Rast_get_d_row`). Every map must be interval-registered
+(explicit start AND end) -- fails loudly, not silently, on an
+instant-registered map, same requirement the superseded Python driver
+had. Sorts chronologically (insertion sort; a forcing series' timestep
+count is small, no need for anything fancier), computes elapsed seconds
+relative to the series' own first start (matching RRI.f90's `t_rain`
+convention), and re-runs increment 2's now-shared
+`read_and_index_forcing_raster` helper once per resolved timestep.
+
+Validated against a synthetic 3-day STRDS with known, distinct
+per-day values (5.0, 10.0, 20.0 mm/h): all three timesteps resolved in
+correct chronological order, `elapsed_s` exactly 86400/172800/259200,
+and each timestep's `qp_t_idx` mean exactly matches its input value.
+Automated as
+`tests/native_io_test.py::test_rain_strds_resolves_and_indexes_every_timestep`
+(7/7 tests passing overall now).
+
+**Still NOT wired into a time loop** -- `rain=`/`rain_strds=` both stop
+at "prove the input is read and indexed correctly," same as before this
+increment. The RK45 loop itself remains the next, larger, higher-risk
+increment, deliberately kept separate.
+
 **Next steps, in order** (per this document's own §5 validation
 discipline -- do not skip ahead):
 
-1. Wire a `rain_strds=` time series (not just a single static raster) --
-   resolve the STRDS's (map, start, end) list once at startup (likely via
-   shelling to `t.rast.list`, per §3's undecided (a)/(b) choice --
-   revisit that decision here now that a concrete need exists), and
-   re-read+re-index the current timestep's map on each outer loop
-   iteration using the SAME `Rast_get_d_row`+`rri_slo_ij2idx` path just
-   validated for a single raster.
-2. **The RK45 time loop itself** -- this is the big, high-risk one.
+1. **The RK45 time loop itself** -- this is the big, high-risk one.
    Reuse the *unchanged* `rri_funcr`/`rri_funcs`/`rri_funcg`/
    `rri_funcrs`/`rri_infilt`/`rri_rk_coeffs_init` from the vendored
    engine, per §3's table, and the vendored engine's own `main.c`
@@ -132,17 +154,17 @@ discipline -- do not skip ahead):
    twice already found real, hard-to-spot bugs (the signed-vs-fabs
    error norm; the zb/zb_riv conflation) that only surfaced after
    sustained validation, not a quick look.
-3. Output: hydrograph + storage to GRASS DB tables via direct DBMI
+2. Output: hydrograph + storage to GRASS DB tables via direct DBMI
    linkage (verify this is practical from a `Module.make` build before
    committing to it over shelling out to `db.execute`); periodic
    full-grid STRDS output requires first implementing the underlying
    feature at all (the vendored engine never had it, ASCII or native --
    see `engine/VENDORED.md`).
-4. Multi-land-use LULC table (`table_input.c`-style pattern, not yet
+3. Multi-land-use LULC table (`table_input.c`-style pattern, not yet
    looked at this pass).
-5. `r.watershed.opencl` auto-invocation from within this module (G_spawn
+4. `r.watershed.opencl` auto-invocation from within this module (G_spawn
    or documented as a required separate step -- undecided).
-6. Once the native path covers the same ground the ASCII path did and is
+5. Once the native path covers the same ground the ASCII path did and is
    validated to the same standard, delete `r.hydro.rri.py`, `engine/`,
    and the `Makefile`'s `engine:` target, and switch the `Makefile` to
    `Module.make` (`PGM = r.hydro.rri`, `LIBES = $(GISLIB) $(RASTERLIB)
