@@ -1,0 +1,2 @@
+/usr/bin/ar qc librri_core.a CMakeFiles/rri_core.dir/src/rri_io.c.o CMakeFiles/rri_core.dir/src/rri_setup.c.o CMakeFiles/rri_core.dir/src/rri_rk.c.o CMakeFiles/rri_core.dir/src/rri_riv.c.o CMakeFiles/rri_core.dir/src/rri_slope.c.o CMakeFiles/rri_core.dir/src/rri_gw.c.o CMakeFiles/rri_core.dir/src/rri_infilt.c.o CMakeFiles/rri_core.dir/src/rri_rivslo.c.o
+/usr/bin/ranlib librri_core.a

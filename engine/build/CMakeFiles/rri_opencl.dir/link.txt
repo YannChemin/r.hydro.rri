@@ -1,0 +1,2 @@
+/usr/bin/ar qc librri_opencl.a CMakeFiles/rri_opencl.dir/src/rri_opencl.c.o
+/usr/bin/ranlib librri_opencl.a

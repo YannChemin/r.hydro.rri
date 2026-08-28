@@ -1,0 +1,1 @@
+/usr/bin/cc -O2 -Wl,--dependency-file=CMakeFiles/rri_cpu.dir/link.d CMakeFiles/rri_cpu.dir/src/main.c.o -o rri_cpu  librri_opencl.a librri_core.a -lm /usr/lib/gcc/x86_64-linux-gnu/14/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a /usr/lib/x86_64-linux-gnu/libOpenCL.so

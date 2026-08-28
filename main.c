@@ -39,6 +39,7 @@
 #include <grass/glocale.h>
 #include <grass/raster.h>
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -252,6 +253,315 @@ static int drainage_to_rri_dir(double drainage)
     }
 }
 
+/* A forcing series already read+converted+indexed once at startup (see
+ * increments 2/3 above) into sc->count-long qp_t_idx arrays, one per
+ * resolved timestep, plus each step's elapsed seconds. n==1 represents
+ * a single static rain= raster applied as constant forcing for the
+ * whole run (elapsed_s[0] set to lasth*3600 by the caller so it always
+ * matches every bracket search below). */
+typedef struct {
+    int n;
+    double *elapsed_s;   /* [n] */
+    double **qp_t_idx;    /* [n][sc->count] */
+} rri_forcing_preloaded;
+
+/**
+ * @brief Increment 4 (NATIVE_GRASS_PLAN.md "Progress"): the adaptive
+ * RK45 coupled river+slope time loop, ported from the vendored engine's
+ * src/main.c (lines ~406-676) with ONLY the I/O boundary changed:
+ * forcing comes from @p rain (preloaded qp_t_idx per resolved STRDS
+ * timestep, see rri_forcing_preloaded) instead of an ASCII rain.dat
+ * block-read, and output is a per-outer-timestep mass-balance diagnostic
+ * printed via G_message instead of storage.dat/hydro.txt file writes --
+ * GRASS-native DB-table/STRDS output is the NEXT increment, not this
+ * one (this one's job is proving the physics loop itself is correct
+ * when driven by native input, via the SAME kind of diagnostic
+ * cross-check every increment before it used).
+ *
+ * Deliberately NOT ported in this increment (kept out to bound scope,
+ * matching what the vendored engine's own config already limits itself
+ * to -- see engine/README.md "What's NOT implemented"): groundwater
+ * (this module's set_single_landuse_defaults always sets ksg=0, so
+ * gw_switch is always false -- the engine's own GW sub-loop is simply
+ * omitted here rather than carried across dead code), the OpenCL
+ * backend (CALL_FUNCR/FUNCS/GW/INFILT macros collapse to their plain-C
+ * calls only -- no --gpu in this increment), and dam/diversion/
+ * boundary conditions/custom cross-sections (none of these are
+ * supported anywhere in this project's C engine, vendored or native).
+ *
+ * The RK45 orchestration itself -- the six-stage Cash-Karp evaluation,
+ * the accept/reject step-size control using the SIGNED (not fabs'd)
+ * error norm, the coupling order (river -> slope -> exchange ->
+ * infiltration -> outlet drain per outer timestep) -- is copied as
+ * closely as possible to the vendored engine's own proven, validated
+ * code, not restructured or "cleaned up," specifically to minimize the
+ * risk of a transcription bug in code this project has twice already
+ * found real, hard-to-spot bugs in (see the file-level doc comment
+ * above main() in engine/src/main.c for both).
+ */
+static void run_rk45_loop(rri_grid *g, rri_riv_cellset *rc, rri_slo_cellset *sc,
+                           double dt, double dt_riv, double lasth, int riv_thresh,
+                           double ns_river, const rri_forcing_preloaded *rain)
+{
+    int nx = g->nx, ny = g->ny;
+    int rc_count = rc->count, sc_count = sc->count;
+
+    double *hs = G_calloc((size_t)ny * nx, sizeof(double));
+    double *hr = G_calloc((size_t)ny * nx, sizeof(double));
+    /* No groundwater sub-loop in this increment (see function doc), but
+     * rri_storage_calc dereferences hg unconditionally regardless of
+     * whether groundwater is active -- the vendored engine always
+     * calloc's a real (zeroed) hg array too (src/main.c line ~325), it
+     * is never NULL there either. Passing NULL here instead crashed
+     * (SIGSEGV in rri_storage_calc, caught while validating this exact
+     * increment) -- a zeroed array, not a null pointer, is the correct
+     * "groundwater storage is zero" representation. */
+    double *hg = G_calloc((size_t)ny * nx, sizeof(double));
+    double *gampt_ff = G_calloc((size_t)ny * nx, sizeof(double));
+    double *qr_ave_grid = G_calloc((size_t)ny * nx, sizeof(double));
+
+    double *hr_idx = G_calloc(rc_count, sizeof(double));
+    double *vr_idx = G_calloc(rc_count, sizeof(double));
+    double *qr_idx = G_calloc(rc_count, sizeof(double));
+    double *qr_ave_idx = G_calloc(rc_count, sizeof(double));
+    double *qr_sum_scratch = G_calloc(rc_count, sizeof(double));
+    double *fr = G_calloc(rc_count, sizeof(double)), *kr2 = G_calloc(rc_count, sizeof(double)),
+           *kr3 = G_calloc(rc_count, sizeof(double)), *kr4 = G_calloc(rc_count, sizeof(double)),
+           *kr5 = G_calloc(rc_count, sizeof(double)), *kr6 = G_calloc(rc_count, sizeof(double)),
+           *vr_temp = G_calloc(rc_count, sizeof(double)), *vr_err = G_calloc(rc_count, sizeof(double));
+
+    double *hs_idx = G_calloc(sc_count, sizeof(double));
+    double *gampt_ff_idx = G_calloc(sc_count, sizeof(double)), *gampt_f_idx = G_calloc(sc_count, sizeof(double));
+    double *qp_t_idx = G_calloc(sc_count, sizeof(double));
+    double *fs = G_calloc(sc_count, sizeof(double)), *ks2 = G_calloc(sc_count, sizeof(double)),
+           *ks3 = G_calloc(sc_count, sizeof(double)), *ks4 = G_calloc(sc_count, sizeof(double)),
+           *ks5 = G_calloc(sc_count, sizeof(double)), *ks6 = G_calloc(sc_count, sizeof(double)),
+           *hs_temp = G_calloc(sc_count, sizeof(double)), *hs_err = G_calloc(sc_count, sizeof(double));
+    double *qs_buf[RRI_LMAX8];
+    for (int l = 0; l < RRI_LMAX8; l++) qs_buf[l] = G_calloc(sc_count, sizeof(double));
+
+    rri_rk_coeffs rk;
+    rri_rk_coeffs_init(&rk);
+
+    int maxt = (int)(lasth * 3600.0 / dt);
+    double rain_sum = 0.0, sout = 0.0;
+
+    G_message(_("run_rk45_loop: maxt=%d dt=%.1f dt_riv=%.1f"), maxt, dt, dt_riv);
+
+    for (int t = 1; t <= maxt; t++) {
+        /* ---- RIVER: adaptive RK45, (t-1)*dt -> t*dt ------------------ */
+        double time = (t - 1) * dt;
+        double ddt = dt_riv;
+        for (int k = 0; k < rc_count; k++) hr_idx[k] = hr[rc->idx2i[k] * nx + rc->idx2j[k]];
+        for (int k = 0; k < rc_count; k++) vr_idx[k] = rri_hr2vr(hr_idx[k], g->area, rc->area_ratio[k]);
+        for (int k = 0; k < rc_count; k++) qr_ave_idx[k] = 0.0;
+
+        while (time < t * dt) {
+            if (time + ddt > t * dt) ddt = t * dt - time;
+            double errmax;
+            double *qr_ave_temp = G_calloc(rc_count, sizeof(double));
+            for (;;) {
+                for (int k = 0; k < rc_count; k++) qr_ave_temp[k] = 0.0;
+
+                rri_funcr(rc, vr_idx, ns_river, g->area, hr_idx, fr, qr_idx, qr_sum_scratch);
+                for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + rk.b21 * ddt * fr[k]; vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
+
+                rri_funcr(rc, vr_temp, ns_river, g->area, hr_idx, kr2, qr_idx, qr_sum_scratch);
+                for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.b31 * fr[k] + rk.b32 * kr2[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
+
+                rri_funcr(rc, vr_temp, ns_river, g->area, hr_idx, kr3, qr_idx, qr_sum_scratch);
+                for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.b41 * fr[k] + rk.b42 * kr2[k] + rk.b43 * kr3[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
+
+                rri_funcr(rc, vr_temp, ns_river, g->area, hr_idx, kr4, qr_idx, qr_sum_scratch);
+                for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.b51 * fr[k] + rk.b52 * kr2[k] + rk.b53 * kr3[k] + rk.b54 * kr4[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
+
+                rri_funcr(rc, vr_temp, ns_river, g->area, hr_idx, kr5, qr_idx, qr_sum_scratch);
+                for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.b61 * fr[k] + rk.b62 * kr2[k] + rk.b63 * kr3[k] + rk.b64 * kr4[k] + rk.b65 * kr5[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
+
+                rri_funcr(rc, vr_temp, ns_river, g->area, hr_idx, kr6, qr_idx, qr_sum_scratch);
+                for (int k = 0; k < rc_count; k++) { double v = vr_idx[k] + ddt * (rk.c1 * fr[k] + rk.c3 * kr3[k] + rk.c4 * kr4[k] + rk.c6 * kr6[k]); vr_temp[k] = v < 0 ? 0 : v; qr_ave_temp[k] += qr_idx[k] * ddt; }
+
+                /* signed maxval, not abs -- see file-level doc */
+                errmax = -DBL_MAX;
+                for (int k = 0; k < rc_count; k++) {
+                    vr_err[k] = ddt * (rk.dc1 * fr[k] + rk.dc3 * kr3[k] + rk.dc4 * kr4[k] + rk.dc5 * kr5[k] + rk.dc6 * kr6[k]);
+                    double he = (rc->domain[k] == 0) ? 0.0 : (vr_err[k] / (g->area * rc->area_ratio[k]));
+                    if (he > errmax) errmax = he;
+                }
+                errmax /= rk.eps;
+
+                if (!(errmax > 1.0 && ddt > rk.ddt_min_riv)) break;
+                double s1 = rk.safety * ddt * pow(errmax, rk.pshrnk), s2 = 0.5 * ddt;
+                ddt = s1 > s2 ? s1 : s2;
+                if (ddt < rk.ddt_min_riv) ddt = rk.ddt_min_riv;
+                if (ddt == 0) G_fatal_error(_("run_rk45_loop: stepsize underflow (riv)"));
+            }
+            if (ddt == rk.ddt_min_riv) {
+                rri_funcr(rc, vr_temp, ns_river, g->area, hr_idx, kr6, qr_idx, qr_sum_scratch);
+                for (int k = 0; k < rc_count; k++) qr_ave_temp[k] = qr_idx[k] * ddt * 6.0;
+            }
+            if (time + ddt > t * dt) ddt = t * dt - time;
+            time += ddt;
+            memcpy(vr_idx, vr_temp, sizeof(double) * rc_count);
+            for (int k = 0; k < rc_count; k++) qr_ave_idx[k] += qr_ave_temp[k];
+            G_free(qr_ave_temp);
+        }
+        for (int k = 0; k < rc_count; k++) qr_ave_idx[k] /= (dt * 6.0);
+        for (int k = 0; k < rc_count; k++) hr_idx[k] = rri_vr2hr(vr_idx[k], g->area, rc->area_ratio[k]);
+        rri_riv_idx2ij(rc, hr_idx, ny, nx, hr);
+        rri_riv_idx2ij(rc, qr_ave_idx, ny, nx, qr_ave_grid);
+
+        /* ---- SLOPE: adaptive RK45, re-resolving the active forcing
+         * step at the start of every sub-step (ddt can span a forcing
+         * timestep boundary) ------------------------------------------ */
+        time = (t - 1) * dt; ddt = dt;
+        rri_slo_ij2idx(sc, hs, nx, hs_idx);
+        rri_slo_ij2idx(sc, gampt_ff, nx, gampt_ff_idx);
+        double *qs_ave_idx = G_calloc(sc_count, sizeof(double));
+
+        while (time < t * dt) {
+            if (time + ddt > t * dt) ddt = t * dt - time;
+
+            /* Bracket search matching RRI.f90's t_rain convention: find
+             * the resolved step whose interval (elapsed_s[j-1],
+             * elapsed_s[j]] contains time+ddt, with an implicit j=0
+             * zero-rain block before the first resolved step (same as
+             * the ASCII engine's own t_rain(0)=0 placeholder). */
+            int itemp = -1;
+            for (int j = 0; j < rain->n; j++) {
+                double lower = (j == 0) ? 0.0 : rain->elapsed_s[j - 1];
+                if (lower < (time + ddt) && (time + ddt) <= rain->elapsed_s[j]) itemp = j;
+            }
+            if (itemp < 0) {
+                for (int k = 0; k < sc_count; k++) qp_t_idx[k] = 0.0;
+            } else {
+                /* rain->qp_t_idx is mm/h (read_and_index_forcing_raster's
+                 * documented, tested contract -- increments 2/3's own
+                 * diagnostics check this exact unit). The physics
+                 * kernels (rri_funcs et al.) expect m/s, matching
+                 * RRI.f90/the vendored engine's load_rain(): "qp = qp /
+                 * 3600.d0 / 1000.d0" applied once at load time there;
+                 * applied here at point of use instead since this
+                 * increment preloads once but must not mutate what
+                 * increments 2/3 already validated. Missing this
+                 * conversion was a real bug caught by cross-checking
+                 * rain_sum against the ASCII engine's own storage.dat on
+                 * the identical synthetic domain -- off by orders of
+                 * magnitude, not a rounding difference. */
+                for (int k = 0; k < sc_count; k++)
+                    qp_t_idx[k] = rain->qp_t_idx[itemp][k] / 3600.0 / 1000.0;
+            }
+
+            double *qs_ave_temp = G_calloc(sc_count, sizeof(double));
+            double errmax;
+            for (;;) {
+                for (int k = 0; k < sc_count; k++) qs_ave_temp[k] = 0.0;
+
+                rri_funcs(sc, hs_idx, qp_t_idx, g->area, fs, qs_buf);
+                for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + rk.b21 * ddt * fs[k]; hs_temp[k] = v < 0 ? 0 : v; }
+                { double *qsum = G_calloc(sc_count, sizeof(double));
+                  for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k];
+                  for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt;
+                  G_free(qsum);
+                }
+
+                rri_funcs(sc, hs_temp, qp_t_idx, g->area, ks2, qs_buf);
+                for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.b31 * fs[k] + rk.b32 * ks2[k]); hs_temp[k] = v < 0 ? 0 : v; }
+                { double *qsum = G_calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; G_free(qsum); }
+
+                rri_funcs(sc, hs_temp, qp_t_idx, g->area, ks3, qs_buf);
+                for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.b41 * fs[k] + rk.b42 * ks2[k] + rk.b43 * ks3[k]); hs_temp[k] = v < 0 ? 0 : v; }
+                { double *qsum = G_calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; G_free(qsum); }
+
+                rri_funcs(sc, hs_temp, qp_t_idx, g->area, ks4, qs_buf);
+                for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.b51 * fs[k] + rk.b52 * ks2[k] + rk.b53 * ks3[k] + rk.b54 * ks4[k]); hs_temp[k] = v < 0 ? 0 : v; }
+                { double *qsum = G_calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; G_free(qsum); }
+
+                rri_funcs(sc, hs_temp, qp_t_idx, g->area, ks5, qs_buf);
+                for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.b61 * fs[k] + rk.b62 * ks2[k] + rk.b63 * ks3[k] + rk.b64 * ks4[k] + rk.b65 * ks5[k]); hs_temp[k] = v < 0 ? 0 : v; }
+                { double *qsum = G_calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; G_free(qsum); }
+
+                rri_funcs(sc, hs_temp, qp_t_idx, g->area, ks6, qs_buf);
+                for (int k = 0; k < sc_count; k++) { double v = hs_idx[k] + ddt * (rk.c1 * fs[k] + rk.c3 * ks3[k] + rk.c4 * ks4[k] + rk.c6 * ks6[k]); hs_temp[k] = v < 0 ? 0 : v; }
+                { double *qsum = G_calloc(sc_count, sizeof(double)); for (int k = 0; k < sc_count; k++) for (int l = 0; l < RRI_LMAX8; l++) qsum[k] += qs_buf[l][k]; for (int k = 0; k < sc_count; k++) qs_ave_temp[k] += qsum[k] * ddt; G_free(qsum); }
+
+                errmax = -DBL_MAX;
+                for (int k = 0; k < sc_count; k++) {
+                    hs_err[k] = ddt * (rk.dc1 * fs[k] + rk.dc3 * ks3[k] + rk.dc4 * ks4[k] + rk.dc5 * ks5[k] + rk.dc6 * ks6[k]);
+                    double he = (sc->domain[k] == 0) ? 0.0 : hs_err[k];
+                    if (he > errmax) errmax = he;
+                }
+                errmax /= rk.eps;
+
+                if (!(errmax > 1.0 && ddt > rk.ddt_min_slo)) break;
+                double s1 = rk.safety * ddt * pow(errmax, rk.pshrnk), s2 = 0.5 * ddt;
+                ddt = s1 > s2 ? s1 : s2;
+                if (ddt < rk.ddt_min_slo) ddt = rk.ddt_min_slo;
+                if (ddt == 0) G_fatal_error(_("run_rk45_loop: stepsize underflow (slo)"));
+            }
+            if (time + ddt > t * dt) ddt = t * dt - time;
+            time += ddt;
+            memcpy(hs_idx, hs_temp, sizeof(double) * sc_count);
+            for (int k = 0; k < sc_count; k++) qs_ave_idx[k] += qs_ave_temp[k];
+            G_free(qs_ave_temp);
+
+            for (int k = 0; k < sc_count; k++) rain_sum += qp_t_idx[k] * g->area * ddt;
+        }
+        for (int k = 0; k < sc_count; k++) qs_ave_idx[k] /= (dt * 6.0);
+        G_free(qs_ave_idx);
+
+        /* No groundwater sub-loop in this increment -- see function doc. */
+
+        rri_slo_idx2ij(sc, hs_idx, ny, nx, hs);
+        rri_slo_idx2ij(sc, gampt_ff_idx, ny, nx, gampt_ff);
+
+        /* ---- RIVER<->SLOPE EXCHANGE + INFILTRATION, once per outer
+         * timestep -------------------------------------------------- */
+        rri_funcrs(g, rc, dt, hr, hs);
+        rri_riv_ij2idx(rc, hr, nx, hr_idx);
+        rri_slo_ij2idx(sc, hs, nx, hs_idx);
+
+        rri_infilt(sc, dt, hs_idx, gampt_ff_idx, gampt_f_idx);
+        rri_slo_idx2ij(sc, hs_idx, ny, nx, hs);
+        rri_slo_idx2ij(sc, gampt_ff_idx, ny, nx, gampt_ff);
+
+        /* ---- OUTLET DRAIN ------------------------------------------- */
+        for (int i = 0; i < ny; i++) {
+            for (int j = 0; j < nx; j++) {
+                size_t p = (size_t)i * nx + j;
+                if (g->domain[p] != 2) continue;
+                sout += hs[p] * g->area;
+                hs[p] = 0.0;
+                if (g->riv[p] == 1) {
+                    int k = -1;
+                    for (int kk = 0; kk < rc_count; kk++) if (rc->idx2i[kk] == i && rc->idx2j[kk] == j) { k = kk; break; }
+                    if (k >= 0) sout += rri_hr2vr(hr[p], g->area, rc->area_ratio[k]);
+                    hr[p] = 0.0;
+                }
+            }
+        }
+
+        rri_storage s = rri_storage_calc(g, hs, hr, hg, gampt_ff, sc, rc, riv_thresh);
+        double storage = s.ss + s.sr + s.si + s.sg;
+        double balance = rain_sum - sout - storage;
+        G_message(_("t=%d/%d time=%.0f rain_sum=%.6e sout=%.6e storage=%.6e "
+                     "balance=%.6e ss=%.6e sr=%.6e si=%.6e sg=%.6e"),
+                   t, maxt, time, rain_sum, sout, storage, balance,
+                   s.ss, s.sr, s.si, s.sg);
+    }
+
+    G_message(_("run_rk45_loop: done"));
+
+    for (int l = 0; l < RRI_LMAX8; l++) G_free(qs_buf[l]);
+    G_free(hs); G_free(hr); G_free(hg); G_free(gampt_ff); G_free(qr_ave_grid);
+    G_free(hr_idx); G_free(vr_idx); G_free(qr_idx); G_free(qr_ave_idx); G_free(qr_sum_scratch);
+    G_free(fr); G_free(kr2); G_free(kr3); G_free(kr4); G_free(kr5); G_free(kr6);
+    G_free(vr_temp); G_free(vr_err);
+    G_free(hs_idx); G_free(gampt_ff_idx); G_free(gampt_f_idx); G_free(qp_t_idx);
+    G_free(fs); G_free(ks2); G_free(ks3); G_free(ks4); G_free(ks5); G_free(ks6);
+    G_free(hs_temp); G_free(hs_err);
+}
+
 int main(int argc, char *argv[])
 {
     struct GModule *module;
@@ -262,8 +572,9 @@ int main(int argc, char *argv[])
         struct Option *ns_river, *ns_slope, *soildepth, *gammaa, *ksv,
             *faif, *ka, *gammam, *beta;
         struct Option *utm;
+        struct Option *lasth, *dt, *dt_riv;
     } opt;
-    struct Flag *eight_dir_flag;
+    struct Flag *eight_dir_flag, *run_flag;
 
     G_gisinit(argv[0]);
 
@@ -428,9 +739,42 @@ int main(int argc, char *argv[])
           "exclusive with rain= in practice (rain_strds= takes priority "
           "if both given).");
 
+    opt.lasth = G_define_option();
+    opt.lasth->key = "lasth";
+    opt.lasth->type = TYPE_DOUBLE;
+    opt.lasth->required = NO;
+    opt.lasth->description =
+        _("Simulation length [hours]. Required together with -r to "
+          "actually run the RK45 time loop -- without it, rain=/"
+          "rain_strds= only run their own isolated read/index diagnostic "
+          "(increments 2/3), same as if -r were omitted.");
+
+    opt.dt = G_define_option();
+    opt.dt->key = "dt";
+    opt.dt->type = TYPE_DOUBLE;
+    opt.dt->answer = "600";
+    opt.dt->description = _("Outer (slope) timestep [s]");
+
+    opt.dt_riv = G_define_option();
+    opt.dt_riv->key = "dt_riv";
+    opt.dt_riv->type = TYPE_DOUBLE;
+    opt.dt_riv->answer = "60";
+    opt.dt_riv->description = _("Initial river RK45 sub-timestep [s]");
+
     eight_dir_flag = G_define_flag();
     eight_dir_flag->key = 'e';
     eight_dir_flag->description = _("8-direction hillslope routing (default: 4-direction)");
+
+    run_flag = G_define_flag();
+    run_flag->key = 'r';
+    run_flag->description =
+        _("Actually run the adaptive RK45 time loop (requires lasth= and "
+          "rain= or rain_strds=). Increment 4 (NATIVE_GRASS_PLAN.md "
+          "'Progress'): prints per-outer-timestep mass-balance "
+          "diagnostics to stderr for cross-checking against RRI.opencl's "
+          "ASCII-path storage.dat on the same domain -- does NOT yet "
+          "write GRASS output (DB table / STRDS), that is the next "
+          "increment.");
 
     if (G_parser(argc, argv)) return EXIT_FAILURE;
 
@@ -575,6 +919,8 @@ int main(int argc, char *argv[])
      * only prove the read+convert+index path is correct, via a
      * checkable diagnostic, in isolation and (for the STRDS case) across
      * a whole resolved series. */
+    rri_forcing_preloaded preloaded = {0, NULL, NULL};
+
     if (opt.rain_strds->answer) {
         rri_forcing_step *steps = NULL;
         int n_steps = resolve_strds_steps(opt.rain_strds->answer, &steps);
@@ -583,16 +929,19 @@ int main(int argc, char *argv[])
                            opt.rain_strds->answer);
         G_message(_("rain_strds: resolved %d timestep(s)"), n_steps);
 
-        double *qp_t_idx = G_malloc(sc.count * sizeof(double));
+        preloaded.n = n_steps;
+        preloaded.elapsed_s = G_malloc(n_steps * sizeof(double));
+        preloaded.qp_t_idx = G_malloc(n_steps * sizeof(double *));
         for (int i = 0; i < n_steps; i++) {
-            read_and_index_forcing_raster(steps[i].name, ny, nx, &sc, qp_t_idx);
+            preloaded.qp_t_idx[i] = G_malloc(sc.count * sizeof(double));
+            read_and_index_forcing_raster(steps[i].name, ny, nx, &sc, preloaded.qp_t_idx[i]);
+            preloaded.elapsed_s[i] = steps[i].elapsed_s;
             double sum = 0.0;
-            for (int k = 0; k < sc.count; k++) sum += qp_t_idx[k];
+            for (int k = 0; k < sc.count; k++) sum += preloaded.qp_t_idx[i][k];
             G_message(_("rain_strds[%d]: map=%s elapsed_s=%.0f mean qp_t_idx=%.6f mm/h"),
                        i, steps[i].name, steps[i].elapsed_s,
                        sc.count ? sum / sc.count : 0.0);
         }
-        G_free(qp_t_idx);
         G_free(steps);
     } else if (opt.rain->answer) {
         double *qp_t_idx = G_malloc(sc.count * sizeof(double));
@@ -607,7 +956,26 @@ int main(int argc, char *argv[])
         for (int k = 0; k < sc.count; k++) sum += qp_t_idx[k];
         G_message(_("rain: mean qp_t_idx over %d active slope cells = %.6f mm/h"),
                    sc.count, sc.count ? sum / sc.count : 0.0);
-        G_free(qp_t_idx);
+
+        /* A single static raster is constant forcing for the whole run:
+         * one preloaded "step" whose elapsed_s is set past the run's
+         * own end, so run_rk45_loop's bracket search always selects it
+         * (see that function's rri_forcing_preloaded doc). */
+        preloaded.n = 1;
+        preloaded.elapsed_s = G_malloc(sizeof(double));
+        preloaded.elapsed_s[0] = (opt.lasth->answer ? atof(opt.lasth->answer) : 1.0) * 3600.0 + 1.0;
+        preloaded.qp_t_idx = G_malloc(sizeof(double *));
+        preloaded.qp_t_idx[0] = qp_t_idx;
+    }
+
+    if (run_flag->answer) {
+        if (!opt.lasth->answer)
+            G_fatal_error(_("-r requires lasth="));
+        if (preloaded.n == 0)
+            G_fatal_error(_("-r requires rain= or rain_strds="));
+        run_rk45_loop(&g, &rc, &sc, atof(opt.dt->answer), atof(opt.dt_riv->answer),
+                       atof(opt.lasth->answer), (int)riv_thresh, atof(opt.ns_river->answer),
+                       &preloaded);
     }
 
     rri_riv_cellset_free(&rc);

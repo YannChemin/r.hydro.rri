@@ -137,10 +137,79 @@ at "prove the input is read and indexed correctly," same as before this
 increment. The RK45 loop itself remains the next, larger, higher-risk
 increment, deliberately kept separate.
 
+**Increment 4 implemented and validated -- the RK45 time loop itself.**
+Ported from the vendored engine's `src/main.c` (~330 lines) into a new
+`run_rk45_loop()` function in this repo's own `main.c`, kept as close as
+possible to the proven code's exact structure/variable names rather than
+restructured, to minimize transcription risk in code this project has
+twice already found subtle bugs in. Only the I/O boundary changed:
+forcing comes from the preloaded `rain_strds=`/`rain=` arrays (increments
+2/3) instead of an ASCII rain.dat block-read; output is a
+per-outer-timestep mass-balance diagnostic (`G_message`) instead of
+`storage.dat`/`hydro.txt` file writes (GRASS-native DB-table/STRDS
+output is still the next increment, not this one). Groundwater and the
+OpenCL backend are out of scope for this increment (see the function's
+own doc comment for why each is safe to omit here).
+
+**Two real bugs found and fixed while building/validating this
+increment** (both would have produced silently wrong results, not
+crashes -- except the first, which did crash):
+
+1. `rri_storage_calc` dereferences its `hg` (groundwater depth) argument
+   unconditionally, even when groundwater is disabled -- passing `NULL`
+   (reasoning "groundwater isn't implemented, so there's nothing to
+   pass") segfaulted immediately. The vendored engine's own `main.c`
+   always allocates a real, zeroed `hg` array regardless of whether
+   groundwater is active; fixed by doing the same here.
+2. Forcing values from `rain->qp_t_idx` are mm/h (the tested, documented
+   contract of increments 2/3's `read_and_index_forcing_raster`) but the
+   physics kernels (`rri_funcs` etc.) expect m/s. The vendored engine's
+   `load_rain()` applies `v / 3600.0 / 1000.0` once at ASCII load time;
+   this port preloads once too but must not silently change what
+   increments 2/3 already validated, so the same conversion is applied
+   at point of use inside the loop instead. Missing this made
+   `rain_sum` wrong by orders of magnitude -- caught immediately by the
+   cross-check below, not by inspection.
+
+**Validated in stages, per this document's own discipline:**
+
+1. **6-timestep run (1 simulated hour), constant 10 mm/h rain, same
+   synthetic domain**: no crash (after fixing bug 1 above), and a tight
+   mass balance (`rain_sum - sout - storage` closes to ~1e-13 relative
+   error at every printed timestep) -- the same kind of sub-check that
+   caught the `storage_calc riv_thresh` bug and the `zb`/`zb_riv` bug
+   earlier in this project.
+2. **Direct cross-check against the vendored ASCII engine
+   (`engine/build/rri_cpu`) on the byte-identical domain and config**:
+   built matching ASCII inputs via the (still-present, still useful for
+   exactly this) old Python driver, ran both engines, and compared
+   `storage.dat`'s final line against the native loop's diagnostic.
+   `rain_sum`, `sout`, `storage`, `ss`, `sr` all agree to 6+ significant
+   figures at every one of the 6 timesteps -- not just the final one.
+   (One test-harness mixup along the way, caught and fixed, not a code
+   bug: the old driver's `rain_units=` defaults to `mm_per_day`, so an
+   unqualified 10.0 raster was silently reinterpreted as "10mm over a
+   day" and divided by 24 -- explains an early apparent 24x discrepancy
+   that had nothing to do with either engine's actual physics.)
+   Automated as
+   `tests/rk45_loop_test.py::test_rk45_loop_matches_ascii_engine_on_synthetic_domain`
+   (relative-tolerance assertions, since the two engines accumulate
+   floating-point sums in a different loop order and are built by
+   different toolchains -- exact bit-equality isn't the right bar here,
+   unlike increment 1's index-setting check, which legitimately was
+   bit-for-bit).
+3. **24-hour stability run** (144 outer timesteps, same domain/rain):
+   completes without crash or divergence; mass balance still closes to
+   ~1e-13 relative error at the final timestep.
+
+Full test suite: **8/8 passing** (3 new: two RK45-loop tests plus the
+`native_io_test.py` compile-fixture update needed once `main.c` started
+referencing the physics-kernel functions unconditionally).
+
 **Next steps, in order** (per this document's own §5 validation
 discipline -- do not skip ahead):
 
-1. **The RK45 time loop itself** -- this is the big, high-risk one.
+1. ~~The RK45 time loop itself~~ -- DONE, see above.
    Reuse the *unchanged* `rri_funcr`/`rri_funcs`/`rri_funcg`/
    `rri_funcrs`/`rri_infilt`/`rri_rk_coeffs_init` from the vendored
    engine, per §3's table, and the vendored engine's own `main.c`
