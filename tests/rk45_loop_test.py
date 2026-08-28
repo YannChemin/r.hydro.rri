@@ -118,7 +118,7 @@ def test_rk45_loop_matches_ascii_engine_on_synthetic_domain(session, native_bina
             "accumulation=acc_rk45_xcheck",
             "riv_thresh=5",
             "rain=rain_rk45_xcheck",
-            "lasth=1", "dt=600", "dt_riv=60",
+            "lasth=1", "dt=600", "dt_riv=60", "rain_units=mm_per_hour",
             "-r", "--v",
         ],
         env=session.env, capture_output=True, text=True,

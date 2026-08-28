@@ -299,9 +299,162 @@ typedef struct {
  * found real, hard-to-spot bugs in (see the file-level doc comment
  * above main() in engine/src/main.c for both).
  */
+/* Increment 5 (NATIVE_GRASS_PLAN.md "Progress"): GRASS-native output.
+ * Collected in memory during the loop, then flushed to real GRASS
+ * objects (raster/STRDS/DB table) once at the end -- no ASCII files
+ * anywhere. Periodic state grids and the DB table are written via
+ * ordinary Rast_* calls (rasters) or a shelled-out t.create/t.register/
+ * db.execute call (STRDS registration and the DB table itself have no
+ * stable C API -- GRASS's temporal framework is Python-only, and DBMI's
+ * C API was not attempted this pass now that a working, simple
+ * subprocess-based pattern was already established for t.rast.list in
+ * increment 3 -- see resolve_strds_steps' doc for that same tradeoff). */
+typedef struct {
+    char hs_prefix[GNAME_MAX];   /* empty string = disabled */
+    int hs_interval;              /* write every Nth outer timestep, N>=1 */
+    rri_forcing_step *hs_written; /* reused: name + elapsed_s per written map */
+    int hs_written_n, hs_written_cap;
+
+    double *hydro_time;   /* [hydro_n] elapsed seconds */
+    double *hydro_q;      /* [hydro_n] discharge at outlet [m^3/s] */
+    int hydro_n, hydro_cap;
+} rri_output_sink;
+
+static void output_sink_init(rri_output_sink *o, const char *hs_prefix, int hs_interval)
+{
+    memset(o, 0, sizeof(*o));
+    if (hs_prefix) snprintf(o->hs_prefix, sizeof(o->hs_prefix), "%s", hs_prefix);
+    o->hs_interval = hs_interval > 0 ? hs_interval : 1;
+}
+
+static void write_state_raster(const char *name, int ny, int nx, const double *grid)
+{
+    int fd = Rast_open_new(name, DCELL_TYPE);
+    DCELL *row = G_malloc(nx * sizeof(DCELL));
+    for (int i = 0; i < ny; i++) {
+        for (int j = 0; j < nx; j++) row[j] = (DCELL)grid[(size_t)i * nx + j];
+        Rast_put_row(fd, row, DCELL_TYPE);
+    }
+    Rast_close(fd);
+    G_free(row);
+    struct History hist;
+    Rast_short_history(name, "raster", &hist);
+    Rast_command_history(&hist);
+    Rast_write_history(name, &hist);
+}
+
+static void output_sink_maybe_write_hs(rri_output_sink *o, int t, double elapsed_s,
+                                        int ny, int nx, const double *hs)
+{
+    if (!o->hs_prefix[0] || t % o->hs_interval != 0) return;
+    if (o->hs_written_n == o->hs_written_cap) {
+        o->hs_written_cap = o->hs_written_cap ? o->hs_written_cap * 2 : 16;
+        o->hs_written = G_realloc(o->hs_written, o->hs_written_cap * sizeof(rri_forcing_step));
+    }
+    char name[GNAME_MAX];
+    snprintf(name, sizeof(name), "%s_%06d", o->hs_prefix, t);
+    write_state_raster(name, ny, nx, hs);
+    snprintf(o->hs_written[o->hs_written_n].name, GNAME_MAX, "%s", name);
+    o->hs_written[o->hs_written_n].elapsed_s = elapsed_s;
+    o->hs_written_n++;
+}
+
+static void output_sink_record_hydro(rri_output_sink *o, double elapsed_s, double q)
+{
+    if (o->hydro_n == o->hydro_cap) {
+        o->hydro_cap = o->hydro_cap ? o->hydro_cap * 2 : 16;
+        o->hydro_time = G_realloc(o->hydro_time, o->hydro_cap * sizeof(double));
+        o->hydro_q = G_realloc(o->hydro_q, o->hydro_cap * sizeof(double));
+    }
+    o->hydro_time[o->hydro_n] = elapsed_s;
+    o->hydro_q[o->hydro_n] = q;
+    o->hydro_n++;
+}
+
+/* Registers every raster in sink->hs_written into a new absolute-time
+ * STRDS named `strds_name`, via t.create + a single t.register call
+ * (one register-file listing all maps, not one subprocess per map --
+ * t.rast.list in increment 3 established this "one small subprocess
+ * call, not a per-value round-trip" pattern, reused here). Timestamps
+ * are POSIX epoch seconds elapsed_s past `t0`, matching run_rk45_loop's
+ * own elapsed-seconds convention throughout. */
+static void register_hs_strds(const rri_output_sink *o, const char *strds_name, time_t t0)
+{
+    if (!o->hs_prefix[0] || o->hs_written_n == 0) return;
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "t.create output=\"%s\" type=strds temporaltype=absolute "
+             "title=\"r.hydro.rri hillslope depth\" "
+             "description=\"hillslope water depth [m], from r.hydro.rri -r\" "
+             "--overwrite", strds_name);
+    if (system(cmd) != 0)
+        G_fatal_error(_("register_hs_strds: t.create failed (see stderr above)"));
+
+    char reg_path[4096];
+    snprintf(reg_path, sizeof(reg_path), "%s", G_tempfile());
+    FILE *f = fopen(reg_path, "w");
+    if (!f) G_fatal_error(_("register_hs_strds: cannot open temp register file"));
+    for (int i = 0; i < o->hs_written_n; i++) {
+        time_t ts = t0 + (time_t)o->hs_written[i].elapsed_s;
+        struct tm *tmv = gmtime(&ts);
+        char buf[32];
+        strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", tmv);
+        fprintf(f, "%s|%s\n", o->hs_written[i].name, buf);
+    }
+    fclose(f);
+
+    snprintf(cmd, sizeof(cmd),
+             "t.register input=\"%s\" type=raster file=\"%s\"",
+             strds_name, reg_path);
+    if (system(cmd) != 0)
+        G_fatal_error(_("register_hs_strds: t.register failed (see stderr above)"));
+    remove(reg_path);
+    G_message(_("registered %d hillslope-depth map(s) into STRDS <%s>"),
+               o->hs_written_n, strds_name);
+}
+
+/* Writes the outlet hydrograph (elapsed_s, discharge_cms) to a new DB
+ * table via one `db.execute` call over a generated SQL script (CREATE
+ * TABLE + one INSERT per row) -- same "shell out once, not per-row"
+ * discipline as register_hs_strds/resolve_strds_steps. */
+static void write_hydrograph_table(const rri_output_sink *o, const char *table_name)
+{
+    if (o->hydro_n == 0) return;
+    char sql_path[4096];
+    snprintf(sql_path, sizeof(sql_path), "%s", G_tempfile());
+    FILE *f = fopen(sql_path, "w");
+    if (!f) G_fatal_error(_("write_hydrograph_table: cannot open temp SQL file"));
+    fprintf(f, "DROP TABLE IF EXISTS %s;\n", table_name);
+    fprintf(f, "CREATE TABLE %s (time_s DOUBLE PRECISION, discharge_cms DOUBLE PRECISION);\n",
+            table_name);
+    for (int i = 0; i < o->hydro_n; i++)
+        fprintf(f, "INSERT INTO %s VALUES (%.2f, %.6f);\n",
+                table_name, o->hydro_time[i], o->hydro_q[i]);
+    fclose(f);
+
+    /* db.connect -c is idempotent ("DB settings already defined, nothing
+     * to do" if a driver/database is already configured) -- a fresh
+     * mapset created via grass.script.setup.init (as this project's own
+     * pytest fixtures do) does not necessarily have one set up the way
+     * `grass -c` does, and db.execute fails outright ("Unable to start
+     * driver <(null)>") without it. Always ensure one exists rather than
+     * asserting the caller's mapset already has it configured. */
+    if (system("db.connect -c") != 0)
+        G_fatal_error(_("write_hydrograph_table: db.connect -c failed (see stderr above)"));
+
+    char cmd[4200];
+    snprintf(cmd, sizeof(cmd), "db.execute input=\"%s\"", sql_path);
+    if (system(cmd) != 0)
+        G_fatal_error(_("write_hydrograph_table: db.execute failed (see stderr above)"));
+    remove(sql_path);
+    G_message(_("wrote %d-row outlet hydrograph to table <%s>"), o->hydro_n, table_name);
+}
+
 static void run_rk45_loop(rri_grid *g, rri_riv_cellset *rc, rri_slo_cellset *sc,
                            double dt, double dt_riv, double lasth, int riv_thresh,
-                           double ns_river, const rri_forcing_preloaded *rain)
+                           double ns_river, const rri_forcing_preloaded *rain,
+                           rri_output_sink *out)
 {
     int nx = g->nx, ny = g->ny;
     int rc_count = rc->count, sc_count = sc->count;
@@ -548,6 +701,24 @@ static void run_rk45_loop(rri_grid *g, rri_riv_cellset *rc, rri_slo_cellset *sc,
                      "balance=%.6e ss=%.6e sr=%.6e si=%.6e sg=%.6e"),
                    t, maxt, time, rain_sum, sout, storage, balance,
                    s.ss, s.sr, s.si, s.sg);
+
+        /* Increment 5 output collection -- see rri_output_sink's doc.
+         * Outlet discharge = qr_ave_grid summed over domain==2 (outlet)
+         * river cells; qr_ave_grid already holds this timestep's
+         * RK45-averaged flux, computed before the outlet-drain step
+         * above zeroed hr/hs there, so reading it afterward is safe
+         * (same quantity the vendored engine's own hydro.txt writer
+         * uses at its hydro_i/hydro_j station cells). */
+        if (out) {
+            double q_outlet = 0.0;
+            for (int i = 0; i < ny; i++)
+                for (int j = 0; j < nx; j++) {
+                    size_t p = (size_t)i * nx + j;
+                    if (g->domain[p] == 2 && g->riv[p] == 1) q_outlet += qr_ave_grid[p];
+                }
+            output_sink_record_hydro(out, time, q_outlet);
+            output_sink_maybe_write_hs(out, t, time, ny, nx, hs);
+        }
     }
 
     G_message(_("run_rk45_loop: done"));
@@ -566,13 +737,14 @@ int main(int argc, char *argv[])
 {
     struct GModule *module;
     struct {
-        struct Option *elevation, *drainage, *accumulation, *rain, *rain_strds;
+        struct Option *elevation, *drainage, *accumulation, *rain, *rain_strds, *rain_units;
         struct Option *riv_thresh, *width_c, *width_s, *depth_c, *depth_s,
             *height_param, *height_limit;
         struct Option *ns_river, *ns_slope, *soildepth, *gammaa, *ksv,
             *faif, *ka, *gammam, *beta;
         struct Option *utm;
         struct Option *lasth, *dt, *dt_riv;
+        struct Option *hs_output, *hs_interval, *hydrograph_table;
     } opt;
     struct Flag *eight_dir_flag, *run_flag;
 
@@ -718,26 +890,45 @@ int main(int argc, char *argv[])
     opt.rain->key = "rain";
     opt.rain->required = NO;
     opt.rain->description =
-        _("Precipitation intensity [mm/h], a SINGLE static raster applied "
-          "as constant forcing for the whole run -- this increment does "
-          "not yet iterate a rain_strds= time series (see "
-          "NATIVE_GRASS_PLAN.md 'Progress'); reads/converts/indexes this "
-          "raster into slope-idx space and reports a diagnostic, but does "
-          "NOT yet drive the RK45 time loop (not wired up yet either).");
+        _("Precipitation intensity, a SINGLE static raster applied as "
+          "constant forcing for the whole run. Units per rain_units= "
+          "(default mm_per_day, converted internally -- see rain_units' "
+          "own description for why that default, not mm_per_hour, is "
+          "the safe one).");
 
     opt.rain_strds = G_define_standard_option(G_OPT_STRDS_INPUT);
     opt.rain_strds->key = "rain_strds";
     opt.rain_strds->required = NO;
     opt.rain_strds->description =
-        _("Precipitation space-time raster dataset [mm/h per map], "
-          "e.g. t.in.era5's <prefix>_precipitation (converted to mm/h "
-          "first if it's t.in.era5's native mm/day -- this option "
-          "expects mm/h already, unlike rain=). Increment 3 (see "
-          "NATIVE_GRASS_PLAN.md 'Progress'): resolves and iterates the "
-          "series, reporting a per-timestep diagnostic -- NOT YET wired "
-          "into the RK45 time loop (doesn't exist yet either). Mutually "
-          "exclusive with rain= in practice (rain_strds= takes priority "
-          "if both given).");
+        _("Precipitation space-time raster dataset, e.g. t.in.era5's "
+          "<prefix>_precipitation. Units per rain_units=. Resolves and "
+          "iterates the series (see resolve_strds_steps), feeding the RK45 "
+          "time loop with -r. Mutually exclusive with rain= in practice "
+          "(rain_strds= takes priority if both given).");
+
+    opt.rain_units = G_define_option();
+    opt.rain_units->key = "rain_units";
+    opt.rain_units->type = TYPE_STRING;
+    opt.rain_units->options = "mm_per_day,mm_per_hour";
+    opt.rain_units->answer = "mm_per_day";
+    opt.rain_units->description =
+        _("Units of rain=/rain_strds='s raster cell values. Default "
+          "mm_per_day matches t.in.era5's ONE AND ONLY output convention "
+          "for precipitation/potential_evaporation (confirmed against "
+          "t.in.era5.py directly: both are registered as daily sums in "
+          "mm, 'Total precipitation, daily sum (mm/d)' -- t.in.era5 has "
+          "no hourly-output mode, so a STRDS from it is always mm/day, "
+          "never a maybe). mm_per_day is divided by 24 to a uniform "
+          "hourly rate before reaching the physics kernels -- this is a "
+          "real simplification (a daily total cannot recover sub-daily "
+          "rainfall intensity variation, only its correct daily mean "
+          "rate), not a unit-only conversion; document this when citing "
+          "results from era5-driven runs. Defaulting to mm_per_hour "
+          "instead would have been the wrong default for this module's "
+          "primary intended forcing source and risks a silent 24x error "
+          "for anyone who feeds t.in.era5 output through without "
+          "noticing -- exactly the mixup this module's own test suite "
+          "hit once already (see NATIVE_GRASS_PLAN.md).");
 
     opt.lasth = G_define_option();
     opt.lasth->key = "lasth";
@@ -764,6 +955,30 @@ int main(int argc, char *argv[])
     eight_dir_flag = G_define_flag();
     eight_dir_flag->key = 'e';
     eight_dir_flag->description = _("8-direction hillslope routing (default: 4-direction)");
+
+    opt.hs_output = G_define_standard_option(G_OPT_STRDS_OUTPUT);
+    opt.hs_output->key = "hs_output";
+    opt.hs_output->required = NO;
+    opt.hs_output->description =
+        _("With -r: name for an output space-time raster dataset (STRDS) "
+          "of hillslope water depth [m], one map per hs_interval outer "
+          "timesteps. Omit to skip periodic state output entirely.");
+
+    opt.hs_interval = G_define_option();
+    opt.hs_interval->key = "hs_interval";
+    opt.hs_interval->type = TYPE_INTEGER;
+    opt.hs_interval->answer = "1";
+    opt.hs_interval->description =
+        _("Write an hs_output= snapshot every N outer timesteps (1 = every timestep)");
+
+    opt.hydrograph_table = G_define_option();
+    opt.hydrograph_table->key = "hydrograph_table";
+    opt.hydrograph_table->type = TYPE_STRING;
+    opt.hydrograph_table->required = NO;
+    opt.hydrograph_table->description =
+        _("With -r: name for an output DB table (time_s, discharge_cms) "
+          "of discharge summed over the domain's outlet river cell(s). "
+          "Omit to skip.");
 
     run_flag = G_define_flag();
     run_flag->key = 'r';
@@ -968,14 +1183,44 @@ int main(int argc, char *argv[])
         preloaded.qp_t_idx[0] = qp_t_idx;
     }
 
+    /* mm/day -> mm/h, applied to the PRELOADED arrays only (what
+     * run_rk45_loop actually consumes), never to the raw values the
+     * rain/rain_strds diagnostics above already printed and that
+     * tests/native_io_test.py checks exactly -- read_and_index_forcing_
+     * raster's contract (returns the raster's own raw cell values) does
+     * not change. See opt.rain_units' description for why mm_per_day is
+     * the default and what physical simplification it represents. */
+    if (preloaded.n > 0 && strcmp(opt.rain_units->answer, "mm_per_day") == 0) {
+        for (int i = 0; i < preloaded.n; i++)
+            for (int k = 0; k < sc.count; k++)
+                preloaded.qp_t_idx[i][k] /= 24.0;
+    }
+
     if (run_flag->answer) {
         if (!opt.lasth->answer)
             G_fatal_error(_("-r requires lasth="));
         if (preloaded.n == 0)
             G_fatal_error(_("-r requires rain= or rain_strds="));
+
+        rri_output_sink sink;
+        output_sink_init(&sink, opt.hs_output->answer, atoi(opt.hs_interval->answer));
+
         run_rk45_loop(&g, &rc, &sc, atof(opt.dt->answer), atof(opt.dt_riv->answer),
                        atof(opt.lasth->answer), (int)riv_thresh, atof(opt.ns_river->answer),
-                       &preloaded);
+                       &preloaded, &sink);
+
+        /* t0 for STRDS timestamps: "now" is as reasonable a default as
+         * any absolute start time, since neither rain_strds= nor rain=
+         * carries a real-world simulation start date into this
+         * increment (rain_strds='s own resolved steps are timestamped
+         * relative to ITS first map's start, not necessarily "now" --
+         * a real deployment would want the STRDS's own start_time
+         * threaded through here instead; not done this pass, flagged in
+         * NATIVE_GRASS_PLAN.md). */
+        time_t t0 = time(NULL);
+        if (opt.hs_output->answer) register_hs_strds(&sink, opt.hs_output->answer, t0);
+        if (opt.hydrograph_table->answer)
+            write_hydrograph_table(&sink, opt.hydrograph_table->answer);
     }
 
     rri_riv_cellset_free(&rc);
