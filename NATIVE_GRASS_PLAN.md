@@ -223,24 +223,51 @@ discipline -- do not skip ahead):
    twice already found real, hard-to-spot bugs (the signed-vs-fabs
    error norm; the zb/zb_riv conflation) that only surfaced after
    sustained validation, not a quick look.
-2. Output: hydrograph + storage to GRASS DB tables via direct DBMI
-   linkage (verify this is practical from a `Module.make` build before
-   committing to it over shelling out to `db.execute`); periodic
-   full-grid STRDS output requires first implementing the underlying
-   feature at all (the vendored engine never had it, ASCII or native --
-   see `engine/VENDORED.md`).
-3. Multi-land-use LULC table (`table_input.c`-style pattern, not yet
-   looked at this pass).
-4. `r.watershed.opencl` auto-invocation from within this module (G_spawn
-   or documented as a required separate step -- undecided).
+2. ~~Output: hydrograph + STRDS.~~ DONE (increment 5): hydrograph to a DB
+   table and periodic hillslope-depth (`hs_output=`) to a GRASS STRDS,
+   both via a single shelled-out `db.execute`/`t.register` call each
+   (direct DBMI/temporal C linkage was not attempted -- GRASS's temporal
+   framework has no stable C API at all, Python-only; a one-shot batched
+   subprocess call was judged the right tradeoff, same reasoning already
+   used for `resolve_strds_steps` in increment 3). Periodic full-grid
+   output beyond `hs` (hr, gampt_ff, etc.) follows the identical pattern,
+   just not built for every variable this pass -- bounded scope, not a
+   design limitation.
+3. ~~Multi-land-use LULC.~~ DONE (increment 7): `landuse=` (static
+   raster, category value = class) plus per-class `ns_slope=`/etc
+   (comma-separated, one per category, or one value applied uniformly).
+   `landuse_strds=` (time-varying land use) is NOT implemented -- see
+   README "Land use / land cover".
+4. ~~`r.watershed.opencl` auto-invocation.~~ DONE (increment 6): shelled
+   out via `system()` (not `G_spawn` -- simpler to build a command
+   string with `snprintf` than use `G_spawn`'s variadic arg-list API,
+   and this project already established the "one clean subprocess call"
+   pattern for `t.rast.list`/`t.register`/`db.execute`). Auto-derived
+   temp rasters are cleaned up after the run. Explicit `drainage=`/
+   `accumulation=` skip it entirely (r.hydro.hbv.basins-style
+   passthrough).
+   Also done, not originally itemized here: `rain_units=` (increment 8,
+   mm_per_day default matching `t.in.era5`'s one and only convention --
+   confirmed directly against `t.in.era5.py`'s source, not assumed).
 5. Once the native path covers the same ground the ASCII path did and is
    validated to the same standard, delete `r.hydro.rri.py`, `engine/`,
    and the `Makefile`'s `engine:` target, and switch the `Makefile` to
    `Module.make` (`PGM = r.hydro.rri`, `LIBES = $(GISLIB) $(RASTERLIB)
    $(MATHLIB)`, mirroring `r.watershed.opencl`'s own Makefile) --
-   NOT done yet; this increment was still built/tested via ad hoc `gcc`
-   invocations (see `tests/native_io_test.py`'s own docstring) precisely
-   to avoid disturbing the still-referenced old Makefile mid-transition. This supersedes the earlier
+   **STILL NOT DONE.** Increments 1-8 above are now built/tested via ad
+   hoc `gcc` invocations (see `tests/native_io_test.py`'s own docstring)
+   precisely to avoid disturbing the still-referenced old Makefile
+   mid-transition; the native path now covers static input, forcing
+   (single-raster and STRDS, ERA5-unit-aware), the full RK45 physics
+   loop, GRASS-native output, `r.watershed.opencl` integration, and
+   pixel-based LULC -- i.e. everything `r.hydro.rri.py` covered and more
+   -- so this retirement is now unblocked in principle, but doing it
+   safely (Makefile rewrite, confirming `g.extension`-installability of
+   the new Module.make build, deleting `r.hydro.rri.py`/`engine/` only
+   once nothing still depends on them for cross-checking) is real,
+   careful work that was not attempted in the same pass as increments
+   5-8, per this project's own "don't rush the risky step under time
+   pressure" discipline. This supersedes the earlier
 "Python wrapper shells out to a vendored `rri_cpu` subprocess reading/
 writing ASCII files" architecture (still present in this directory as of
 this writing — `r.hydro.rri.py`, `engine/`, `Makefile`'s `engine:` target

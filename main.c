@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "rri/rri.h"
 
@@ -183,47 +184,77 @@ static void read_and_index_forcing_raster(const char *raster_name, int ny, int n
  * is NOT implemented in this increment -- see README "Known gaps"; land[]
  * is hardcoded to 1 everywhere, same simplification the vendored engine's
  * own main.c already had. */
-static void set_single_landuse_defaults(rri_landuse *lu, double ns_slope,
-                                         double soildepth, double gammaa,
-                                         double ksv, double faif, double ka,
-                                         double gammam, double beta)
+/* Parses a G_parser multi-value option's opt->answers (NULL-terminated
+ * string array; a plain scalar option still has exactly one entry
+ * there) into a caller-allocated double[n] -- fails loudly if the
+ * option provided fewer values than num_of_landuse requires, rather
+ * than silently reusing the last value or defaulting missing classes
+ * (a class silently inheriting another class's parameters would be a
+ * much worse surprise than a clear error naming the option). */
+static void parse_per_landuse_option(struct Option *opt, int n, double *out, const char *label)
 {
-    lu->n = 1;
-    lu->dif = G_malloc(sizeof(int));
-    lu->ns_slope = G_malloc(sizeof(double));
-    lu->soildepth = G_malloc(sizeof(double));
-    lu->gammaa = G_malloc(sizeof(double));
-    lu->ksv = G_malloc(sizeof(double));
-    lu->faif = G_malloc(sizeof(double));
-    lu->ka = G_malloc(sizeof(double));
-    lu->gammam = G_malloc(sizeof(double));
-    lu->beta = G_malloc(sizeof(double));
-    lu->ksg = G_malloc(sizeof(double));
-    lu->gammag = G_malloc(sizeof(double));
-    lu->kg0 = G_malloc(sizeof(double));
-    lu->fpg = G_malloc(sizeof(double));
-    lu->rgl = G_malloc(sizeof(double));
-    lu->da = G_malloc(sizeof(double));
-    lu->dm = G_malloc(sizeof(double));
-    lu->infilt_limit = G_malloc(sizeof(double));
+    int count = 0;
+    if (opt->answers) while (opt->answers[count]) count++;
+    if (count == 1 && n > 1) {
+        /* A single value with landuse='s multiple classes: apply
+         * uniformly rather than fatal -- explicitly documented in the
+         * option's own description as the intentional "same value for
+         * every class" shorthand, not a silent bug. */
+        for (int i = 0; i < n; i++) out[i] = atof(opt->answers[0]);
+        return;
+    }
+    if (count != n)
+        G_fatal_error(_("%s: got %d value(s), need exactly %d (one per landuse= "
+                         "category 1..%d), or exactly 1 to apply uniformly"),
+                       label, count, n, n);
+    for (int i = 0; i < n; i++) out[i] = atof(opt->answers[i]);
+}
 
-    lu->dif[0] = 1;
-    lu->ns_slope[0] = ns_slope;
-    lu->soildepth[0] = soildepth;
-    lu->gammaa[0] = gammaa;
-    lu->ksv[0] = ksv;
-    lu->faif[0] = faif;
-    lu->ka[0] = ka;
-    lu->gammam[0] = gammam;
-    lu->beta[0] = beta;
-    lu->ksg[0] = 0.0;
-    lu->gammag[0] = 0.0;
-    lu->kg0[0] = 0.0;
-    lu->fpg[0] = 0.0;
-    lu->rgl[0] = 0.0;
-    lu->da[0] = (soildepth > 0.0 && ka > 0.0) ? soildepth * gammaa : 0.0;
-    lu->dm[0] = (soildepth > 0.0 && ka > 0.0 && gammam > 0.0) ? soildepth * gammam : 0.0;
-    lu->infilt_limit[0] = (soildepth > 0.0 && ksv > 0.0) ? soildepth * gammaa : 0.0;
+static void set_landuse_from_options(rri_landuse *lu, int n,
+                                      struct Option *ns_slope_opt, struct Option *soildepth_opt,
+                                      struct Option *gammaa_opt, struct Option *ksv_opt,
+                                      struct Option *faif_opt, struct Option *ka_opt,
+                                      struct Option *gammam_opt, struct Option *beta_opt)
+{
+    lu->n = n;
+    lu->dif = G_malloc(n * sizeof(int));
+    lu->ns_slope = G_malloc(n * sizeof(double));
+    lu->soildepth = G_malloc(n * sizeof(double));
+    lu->gammaa = G_malloc(n * sizeof(double));
+    lu->ksv = G_malloc(n * sizeof(double));
+    lu->faif = G_malloc(n * sizeof(double));
+    lu->ka = G_malloc(n * sizeof(double));
+    lu->gammam = G_malloc(n * sizeof(double));
+    lu->beta = G_malloc(n * sizeof(double));
+    lu->ksg = G_calloc(n, sizeof(double));
+    lu->gammag = G_calloc(n, sizeof(double));
+    lu->kg0 = G_calloc(n, sizeof(double));
+    lu->fpg = G_calloc(n, sizeof(double));
+    lu->rgl = G_calloc(n, sizeof(double));
+    lu->da = G_malloc(n * sizeof(double));
+    lu->dm = G_malloc(n * sizeof(double));
+    lu->infilt_limit = G_malloc(n * sizeof(double));
+
+    parse_per_landuse_option(ns_slope_opt, n, lu->ns_slope, "ns_slope");
+    parse_per_landuse_option(soildepth_opt, n, lu->soildepth, "soildepth");
+    parse_per_landuse_option(gammaa_opt, n, lu->gammaa, "gammaa");
+    parse_per_landuse_option(ksv_opt, n, lu->ksv, "ksv");
+    parse_per_landuse_option(faif_opt, n, lu->faif, "faif");
+    parse_per_landuse_option(ka_opt, n, lu->ka, "ka");
+    parse_per_landuse_option(gammam_opt, n, lu->gammam, "gammam");
+    parse_per_landuse_option(beta_opt, n, lu->beta, "beta");
+
+    for (int i = 0; i < n; i++) {
+        if (lu->ksv[i] > 0.0 && lu->ka[i] > 0.0)
+            G_fatal_error(_("landuse class %d: ksv and ka cannot both be nonzero "
+                             "(RRI's own parameter-check rule)"), i + 1);
+        lu->dif[i] = 1;
+        lu->da[i] = (lu->soildepth[i] > 0.0 && lu->ka[i] > 0.0) ? lu->soildepth[i] * lu->gammaa[i] : 0.0;
+        lu->dm[i] = (lu->soildepth[i] > 0.0 && lu->ka[i] > 0.0 && lu->gammam[i] > 0.0)
+                        ? lu->soildepth[i] * lu->gammam[i] : 0.0;
+        lu->infilt_limit[i] = (lu->soildepth[i] > 0.0 && lu->ksv[i] > 0.0)
+                                   ? lu->soildepth[i] * lu->gammaa[i] : 0.0;
+    }
 }
 
 /* r.watershed's (and r.watershed.opencl's, for drop-in compatibility)
@@ -237,6 +268,36 @@ static void set_single_landuse_defaults(rri_landuse *lu, double ns_slope,
  * reclass_direction_to_rri, which was smoke-tested but never
  * cross-validated against a real watershed with independently-known
  * flow paths -- same caveat applies here. */
+/* Runs r.watershed.opencl (this user's own GPU-accelerated, validated
+ * addon -- see $HOME/dev/r.watershed.opencl/README.md -- a drop-in
+ * replacement for r.watershed at basin scale, where stock r.watershed's
+ * single-threaded core is impractically slow) to derive drainage/
+ * accumulation when the caller did not supply their own, writing to
+ * *drainage_out/*accum_out (caller-owned buffers, GNAME_MAX each).
+ * Fails loudly (not silently falling back to stock r.watershed) if
+ * r.watershed.opencl isn't installed or errors -- matches this
+ * project's fail-loud convention; a silent fallback to a much slower
+ * tool on a basin-scale DEM would be a worse surprise than a clear
+ * error telling the caller to install the addon or supply drainage=/
+ * accumulation= themselves. */
+static void auto_derive_drainage_accumulation(const char *elevation, int threshold,
+                                               char *drainage_out, char *accum_out)
+{
+    snprintf(drainage_out, GNAME_MAX, "rri_auto_drainage_%d", (int)getpid());
+    snprintf(accum_out, GNAME_MAX, "rri_auto_accum_%d", (int)getpid());
+
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "r.watershed.opencl elevation=\"%s\" threshold=%d "
+             "drainage=\"%s\" accumulation=\"%s\" --overwrite",
+             elevation, threshold, drainage_out, accum_out);
+    G_message(_("drainage=/accumulation= not given -- running: %s"), cmd);
+    if (system(cmd) != 0)
+        G_fatal_error(_("auto_derive_drainage_accumulation: r.watershed.opencl failed "
+                         "(see stderr above) -- install $HOME/dev/r.watershed.opencl, "
+                         "or supply drainage=/accumulation= yourself"));
+}
+
 static int drainage_to_rri_dir(double drainage)
 {
     if (Rast_is_d_null_value(&drainage) || drainage < 0) return 0;
@@ -738,6 +799,7 @@ int main(int argc, char *argv[])
     struct GModule *module;
     struct {
         struct Option *elevation, *drainage, *accumulation, *rain, *rain_strds, *rain_units;
+        struct Option *landuse;
         struct Option *riv_thresh, *width_c, *width_s, *depth_c, *depth_s,
             *height_param, *height_limit;
         struct Option *ns_river, *ns_slope, *soildepth, *gammaa, *ksv,
@@ -745,6 +807,7 @@ int main(int argc, char *argv[])
         struct Option *utm;
         struct Option *lasth, *dt, *dt_riv;
         struct Option *hs_output, *hs_interval, *hydrograph_table;
+        struct Option *watershed_threshold;
     } opt;
     struct Flag *eight_dir_flag, *run_flag;
 
@@ -764,22 +827,44 @@ int main(int argc, char *argv[])
 
     opt.drainage = G_define_standard_option(G_OPT_R_INPUT);
     opt.drainage->key = "drainage";
-    opt.drainage->required = YES;
+    opt.drainage->required = NO;
     opt.drainage->description =
         _("D8 flow direction, r.watershed/r.watershed.opencl 'drainage' "
           "convention (counter-clockwise from north-east=1, negative at "
-          "domain edges). Not auto-derived in this increment -- run "
-          "r.watershed.opencl (or r.watershed) first.");
+          "domain edges). Omit to auto-derive via r.watershed.opencl "
+          "(watershed_threshold= controls its threshold=; see that "
+          "option's description) -- pass this explicitly instead when "
+          "you already have one (e.g. from a prior r.watershed.opencl "
+          "run reused across experiments, mirroring r.hydro.hbv.basins' "
+          "drainage_input=-style passthrough pattern) to skip "
+          "recomputing it, which can be the difference between minutes "
+          "and over an hour on a basin-scale DEM.");
 
     opt.accumulation = G_define_standard_option(G_OPT_R_INPUT);
     opt.accumulation->key = "accumulation";
-    opt.accumulation->required = YES;
+    opt.accumulation->required = NO;
     opt.accumulation->description =
         _("Flow accumulation (cell count), r.watershed/r.watershed.opencl "
           "convention. Magnitude only is used (sign, where present, is "
           "r.watershed's own per-cell reliability flag, not part of RRI's "
           "model -- see drainage_to_rri_dir's neighboring comment for the "
-          "equivalent caveat on 'drainage').");
+          "equivalent caveat on 'drainage'). Omit to auto-derive via "
+          "r.watershed.opencl alongside drainage= -- see that option's "
+          "description.");
+
+    opt.watershed_threshold = G_define_option();
+    opt.watershed_threshold->key = "watershed_threshold";
+    opt.watershed_threshold->type = TYPE_INTEGER;
+    opt.watershed_threshold->answer = "1";
+    opt.watershed_threshold->description =
+        _("r.watershed.opencl's own threshold= (minimum exterior basin "
+          "size, cells), used only when auto-deriving drainage=/"
+          "accumulation= (i.e. when at least one of them is omitted). "
+          "This module never reads r.watershed.opencl's stream=/basin= "
+          "outputs, so the default of 1 (finest-grained, no effect on "
+          "drainage/accumulation themselves) is safe -- raise it only if "
+          "you separately care about r.watershed.opencl's basin "
+          "delineation on the SAME run for some other purpose.");
 
     opt.riv_thresh = G_define_option();
     opt.riv_thresh->key = "riv_thresh";
@@ -831,53 +916,86 @@ int main(int argc, char *argv[])
     opt.ns_river->answer = "0.03";
     opt.ns_river->description = _("River Manning's roughness coefficient");
 
+    /* Each of these 8 is PER-LANDUSE-CLASS: with landuse=, pass exactly
+     * num_of_landuse (the raster's max category value) comma-separated
+     * values, in category order 1..N -- e.g. ns_slope=0.4,0.1,0.02 for
+     * 3 classes. A single value applies uniformly to every class
+     * (including the landuse=-omitted, single-class default case).
+     * See README "Land use / land cover" for a worked example. */
     opt.ns_slope = G_define_option();
     opt.ns_slope->key = "ns_slope";
     opt.ns_slope->type = TYPE_DOUBLE;
+    opt.ns_slope->multiple = YES;
     opt.ns_slope->answer = "0.4";
-    opt.ns_slope->description = _("Hillslope Manning's roughness coefficient");
+    opt.ns_slope->description = _("Hillslope Manning's roughness coefficient, one per landuse= class (or one value for all)");
 
     opt.soildepth = G_define_option();
     opt.soildepth->key = "soildepth";
     opt.soildepth->type = TYPE_DOUBLE;
+    opt.soildepth->multiple = YES;
     opt.soildepth->answer = "1.0";
-    opt.soildepth->description = _("Soil depth [m]");
+    opt.soildepth->description = _("Soil depth [m], one per landuse= class (or one value for all)");
 
     opt.gammaa = G_define_option();
     opt.gammaa->key = "gammaa";
     opt.gammaa->type = TYPE_DOUBLE;
+    opt.gammaa->multiple = YES;
     opt.gammaa->answer = "0.475";
-    opt.gammaa->description = _("Soil porosity [-]");
+    opt.gammaa->description = _("Soil porosity [-], one per landuse= class (or one value for all)");
 
     opt.ksv = G_define_option();
     opt.ksv->key = "ksv";
     opt.ksv->type = TYPE_DOUBLE;
+    opt.ksv->multiple = YES;
     opt.ksv->answer = "0.0";
-    opt.ksv->description = _("Green-Ampt vertical saturated hydraulic conductivity [m/s] (0 disables)");
+    opt.ksv->description = _("Green-Ampt vertical saturated hydraulic conductivity [m/s] (0 disables), one per landuse= class (or one value for all)");
 
     opt.faif = G_define_option();
     opt.faif->key = "faif";
     opt.faif->type = TYPE_DOUBLE;
+    opt.faif->multiple = YES;
     opt.faif->answer = "0.316";
-    opt.faif->description = _("Green-Ampt wetting front suction head [m]");
+    opt.faif->description = _("Green-Ampt wetting front suction head [m], one per landuse= class (or one value for all)");
 
     opt.ka = G_define_option();
     opt.ka->key = "ka";
     opt.ka->type = TYPE_DOUBLE;
+    opt.ka->multiple = YES;
     opt.ka->answer = "0.0";
-    opt.ka->description = _("Lateral subsurface (Darcy) conductivity [m/s] (0 disables; mutually exclusive with ksv)");
+    opt.ka->description = _("Lateral subsurface (Darcy) conductivity [m/s] (0 disables; mutually exclusive with ksv), one per landuse= class (or one value for all)");
 
     opt.gammam = G_define_option();
     opt.gammam->key = "gammam";
     opt.gammam->type = TYPE_DOUBLE;
+    opt.gammam->multiple = YES;
     opt.gammam->answer = "0.0";
-    opt.gammam->description = _("Matrix-flow porosity [-]");
+    opt.gammam->description = _("Matrix-flow porosity [-], one per landuse= class (or one value for all)");
 
     opt.beta = G_define_option();
     opt.beta->key = "beta";
     opt.beta->type = TYPE_DOUBLE;
+    opt.beta->multiple = YES;
     opt.beta->answer = "8.0";
-    opt.beta->description = _("Hillslope subsurface flow power-law exponent");
+    opt.beta->description = _("Hillslope subsurface flow power-law exponent, one per landuse= class (or one value for all)");
+
+    opt.landuse = G_define_standard_option(G_OPT_R_INPUT);
+    opt.landuse->key = "landuse";
+    opt.landuse->required = NO;
+    opt.landuse->description =
+        _("Classified land-use/land-cover raster. The raster's CELL "
+          "VALUES (integer categories, read via Rast_get_c_row) are what "
+          "matters -- category LABEL text (r.category/r.support) is "
+          "metadata the physics never reads. Categories must be "
+          "1..num_of_landuse (this module takes num_of_landuse = the "
+          "raster's own max category value), each representing a "
+          "distinct combination of ns_slope=/soildepth=/gammaa=/etc "
+          "(a hydraulic-parameter class, not a semantic land-cover label "
+          "GRASS has any opinion about). Omit for a single uniform class "
+          "over the whole domain. See README for a worked r.reclass "
+          "example building a 1..N raster from a real classified source "
+          "(MODIS MCD12Q1, ESA WorldCover, ...). Time-varying land use "
+          "(a landuse_strds= option) is not implemented -- see "
+          "NATIVE_GRASS_PLAN.md.");
 
     opt.utm = G_define_option();
     opt.utm->key = "utm";
@@ -1016,9 +1134,20 @@ int main(int argc, char *argv[])
     Rast_close(fd_elev);
     G_free(zs_row);
 
-    mapset = G_find_raster2(opt.drainage->answer, "");
-    if (!mapset) G_fatal_error(_("Raster map <%s> not found"), opt.drainage->answer);
-    int fd_dir = Rast_open_old(opt.drainage->answer, mapset);
+    char drainage_name[GNAME_MAX], accum_name[GNAME_MAX];
+    int auto_derived = !opt.drainage->answer || !opt.accumulation->answer;
+    if (auto_derived) {
+        auto_derive_drainage_accumulation(opt.elevation->answer,
+                                           atoi(opt.watershed_threshold->answer),
+                                           drainage_name, accum_name);
+    } else {
+        snprintf(drainage_name, sizeof(drainage_name), "%s", opt.drainage->answer);
+        snprintf(accum_name, sizeof(accum_name), "%s", opt.accumulation->answer);
+    }
+
+    mapset = G_find_raster2(drainage_name, "");
+    if (!mapset) G_fatal_error(_("Raster map <%s> not found"), drainage_name);
+    int fd_dir = Rast_open_old(drainage_name, mapset);
     DCELL *dir_row = G_malloc(nx * sizeof(DCELL));
     int *dir_rri = G_malloc(ncell * sizeof(int));
     for (int row = 0; row < ny; row++) {
@@ -1029,9 +1158,9 @@ int main(int argc, char *argv[])
     Rast_close(fd_dir);
     G_free(dir_row);
 
-    mapset = G_find_raster2(opt.accumulation->answer, "");
-    if (!mapset) G_fatal_error(_("Raster map <%s> not found"), opt.accumulation->answer);
-    int fd_acc = Rast_open_old(opt.accumulation->answer, mapset);
+    mapset = G_find_raster2(accum_name, "");
+    if (!mapset) G_fatal_error(_("Raster map <%s> not found"), accum_name);
+    int fd_acc = Rast_open_old(accum_name, mapset);
     DCELL *acc_row = G_malloc(nx * sizeof(DCELL));
     double *acc = G_malloc(ncell * sizeof(double));
     for (int row = 0; row < ny; row++) {
@@ -1063,13 +1192,51 @@ int main(int argc, char *argv[])
     g.len_riv = G_calloc(ncell, sizeof(double));
     g.area_ratio = G_calloc(ncell, sizeof(double));
 
-    double soildepth = atof(opt.soildepth->answer);
+    /* LULC: landuse= raster's own cell VALUES (categories), read via
+     * Rast_get_c_row -- NOT a category label from r.category/r.support,
+     * which is metadata the physics never reads. Categories must be
+     * 1..num_of_landuse contiguous, matching RRI's own per-landuse
+     * parameter-array indexing; num_of_landuse is taken as the raster's
+     * own maximum category value. Omit landuse= for a single uniform
+     * class covering the whole domain (num_of_landuse=1, land[]=1
+     * everywhere) -- see README "Land use / land cover" for a worked
+     * r.reclass example (MODIS/WorldCover -> a 1..N class raster). */
+    int num_of_landuse = 1;
+    if (opt.landuse->answer) {
+        const char *lu_mapset = G_find_raster2(opt.landuse->answer, "");
+        if (!lu_mapset) G_fatal_error(_("Raster map <%s> not found"), opt.landuse->answer);
+        int fd_lu = Rast_open_old(opt.landuse->answer, lu_mapset);
+        CELL *lu_row = G_malloc(nx * sizeof(CELL));
+        int max_cat = 1;
+        for (int row = 0; row < ny; row++) {
+            Rast_get_c_row(fd_lu, lu_row, row);
+            for (int col = 0; col < nx; col++) {
+                int v = Rast_is_c_null_value(&lu_row[col]) ? 1 : lu_row[col];
+                if (v < 1) G_fatal_error(_("landuse=<%s> has a category value %d < 1 at "
+                                            "row %d col %d -- categories must be 1..N"),
+                                          opt.landuse->answer, v, row, col);
+                g.land[(size_t)row * nx + col] = v;
+                if (v > max_cat) max_cat = v;
+            }
+        }
+        Rast_close(fd_lu);
+        G_free(lu_row);
+        num_of_landuse = max_cat;
+        G_message(_("landuse=<%s>: %d class(es) (max category value)"),
+                   opt.landuse->answer, num_of_landuse);
+    } else {
+        for (size_t p = 0; p < ncell; p++) g.land[p] = 1;
+    }
+
+    rri_landuse lu;
+    set_landuse_from_options(&lu, num_of_landuse,
+                              opt.ns_slope, opt.soildepth, opt.gammaa, opt.ksv,
+                              opt.faif, opt.ka, opt.gammam, opt.beta);
 
     for (size_t p = 0; p < ncell; p++) {
-        g.land[p] = 1;
         if (zs[p] > -100.0)
             g.domain[p] = (g.dir[p] == 0) ? 2 : 1;
-        g.zb[p] = zs[p] - soildepth;
+        g.zb[p] = zs[p] - lu.soildepth[g.land[p] - 1];
         g.zb_riv[p] = zs[p];
     }
 
@@ -1109,12 +1276,6 @@ int main(int argc, char *argv[])
         g.zb_riv[p] = zs[p] - g.depth[p];
     }
     G_free(zs);
-
-    rri_landuse lu;
-    set_single_landuse_defaults(&lu, atof(opt.ns_slope->answer), soildepth,
-                                 atof(opt.gammaa->answer), atof(opt.ksv->answer),
-                                 atof(opt.faif->answer), atof(opt.ka->answer),
-                                 atof(opt.gammam->answer), atof(opt.beta->answer));
 
     rri_riv_cellset rc;
     rri_slo_cellset sc;
@@ -1225,6 +1386,13 @@ int main(int argc, char *argv[])
 
     rri_riv_cellset_free(&rc);
     rri_slo_cellset_free(&sc);
+
+    if (auto_derived) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd), "g.remove -f type=raster name=\"%s,%s\" --quiet",
+                 drainage_name, accum_name);
+        system(cmd); /* best-effort cleanup of the auto-derived temp rasters; not fatal if it fails */
+    }
 
     return EXIT_SUCCESS;
 }
