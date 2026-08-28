@@ -113,17 +113,14 @@ def test_hydrograph_table_and_hs_strds_written(session, native_binary):
 
 
 def test_hydro_zero_matches_ascii_engine_cross_check(session, tmp_path):
-    """Same domain/config through the OLD (still-present, still useful
-    for exactly this) ASCII engine -- confirms the native path's
-    all-zero discharge isn't a native-only artifact."""
+    """Same domain/config through the vendored ASCII engine (kept only
+    for this cross-check, see tests/ascii_reference.py) -- confirms the
+    native path's all-zero discharge isn't a native-only artifact."""
     if not os.path.isfile(ENGINE_BIN):
         pytest.skip(f"{ENGINE_BIN} not built")
 
-    import datetime
-
+    from ascii_reference import write_reference_project
     from grass.tools import Tools
-
-    import grass.script as gs
 
     tools = Tools(session=session)
     tools.g_region(n=10, s=0, e=10, w=0, res=1)
@@ -131,35 +128,18 @@ def test_hydro_zero_matches_ascii_engine_cross_check(session, tmp_path):
         expression="dem_output_xcheck = 100.0 - row() * 1.7 - col() * 1.3",
         overwrite=True,
     )
-    tools.t_create(
-        output="rain_output_xcheck_strds", type="strds", temporaltype="absolute",
-        title="x", description="x", overwrite=True,
-    )
-    tools.r_mapcalc(expression="rain_output_xcheck = 10.0", overwrite=True)
-    d0 = datetime.date(2026, 1, 1)
-    d1 = d0 + datetime.timedelta(days=1)
-    register_file = gs.tempfile(env=session.env)
-    with open(register_file, "w") as f:
-        f.write(f"rain_output_xcheck|{d0.isoformat()}|{d1.isoformat()}")
-    gs.run_command(
-        "t.register", input="rain_output_xcheck_strds", type="raster",
-        file=register_file, env=session.env,
+    tools.r_watershed(
+        elevation="dem_output_xcheck", drainage="drain_output_xcheck",
+        accumulation="acc_output_xcheck", flags="s",
     )
 
     project_dir = str(tmp_path / "ascii_output_xcheck")
-    old_driver = os.path.join(MODULE_DIR, "r.hydro.rri.py")
-    result = subprocess.run(
-        [
-            "python3", old_driver,
-            "elevation=dem_output_xcheck",
-            "rain_strds=rain_output_xcheck_strds",
-            "rain_units=mm_per_hour",
-            f"project_dir={project_dir}",
-            "lasth=24", "dt=600", "dt_riv=60", "riv_thresh=5",
-        ],
-        env=session.env, capture_output=True, text=True,
+    write_reference_project(
+        tools, session, project_dir,
+        elevation="dem_output_xcheck", accumulation="acc_output_xcheck",
+        direction="drain_output_xcheck", rain_mm_per_hour=10.0,
+        lasth=24, dt=600, dt_riv=60, riv_thresh=5,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
 
     result = subprocess.run([ENGINE_BIN, project_dir + os.sep], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr

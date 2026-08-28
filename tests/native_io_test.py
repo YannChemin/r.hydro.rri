@@ -1,14 +1,14 @@
 """Validates the native GRASS-C I/O layer (main.c, rri_setup.c, rri_geo.c
--- NATIVE_GRASS_PLAN.md's first increment: static input + index setting,
-no forcing/RK45/output yet) against the OLD, already-validated ASCII-file
-architecture's known-good numbers on the identical synthetic domain.
+-- NATIVE_GRASS_PLAN.md's first increment: static input + index setting)
+against known-good numbers checked, during original development, bit-
+for-bit against the (now-retired) ASCII-file architecture on the
+identical synthetic domain.
 
 This is compiled ad hoc here (plain gcc against GRASS's own libs/headers,
-via `grass --config`) rather than through the project's real Makefile,
-because the Makefile transition from Script.make (old r.hydro.rri.py
-driver) to Module.make (this native module) is not yet done -- see
-NATIVE_GRASS_PLAN.md section 7. Once that transition happens this test
-should build through the normal addon Makefile instead.
+via `grass --config`) rather than through the project's real Makefile
+(now Module.make, see ../Makefile) -- kept this way so the test suite
+doesn't depend on a prior `make`/`g.extension install` having already
+happened; it exercises the exact same source files either way.
 """
 
 import os

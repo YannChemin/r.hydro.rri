@@ -7,34 +7,32 @@ raster forcing** (e.g. `t.in.era5` precipitation and potential
 evapotranspiration) -- and, optionally, runs the model and imports its
 results back into GRASS as native rasters/STRDS/DB tables.
 
-## Two architectures currently coexist in this repo -- read this first
+## Architecture
 
-This repo is mid-transition. **`main.c` (built with plain `gcc`, or via
-the Makefile once it's switched over -- see "Status" below) is the real,
-current, actively-developed architecture**: a compiled GRASS C module
-with zero ASCII intermediate files anywhere in the pipeline -- GRASS
-rasters and STRDS in, GRASS rasters/STRDS/DB tables out, the RRI physics
-engine linked in directly (not shelled out to as a separate binary).
+`main.c` is a compiled GRASS C module (`Module.make`, built via `make` or
+`g.extension`) with **zero ASCII intermediate files anywhere in the
+pipeline** -- GRASS rasters and STRDS in, GRASS rasters/STRDS/DB tables
+out. The RRI physics engine (adaptive Cash-Karp RK45 river/hillslope
+routing, river<->slope exchange, Green-Ampt infiltration) is linked in
+directly from `engine/` (a vendored, frozen source copy of `RRI.opencl`
+-- see `engine/VENDORED.md`), not shelled out to as a separate binary.
 
-`r.hydro.rri.py` (a Python script) plus `engine/` (a vendored, frozen
-copy of `RRI.opencl`) are the **superseded, first-draft architecture**:
-write ASCII `RRI_Input.txt`/grid files, shell out to a separate compiled
-`rri_cpu` binary, import only the hydrograph back via `db.in.ogr`. Kept
-around only because it is still genuinely useful as a second, independent
-implementation to cross-check the native path's numbers against (see
-"Validation" below) -- **not** because it's a supported way to use this
-module going forward. See `NATIVE_GRASS_PLAN.md` for the full rationale,
-increment-by-increment history, and the plan for retiring it once the
-native path's coverage is confirmed equivalent.
-
-**If you're just trying to use this module: use the compiled `main.c`
-module (see "Quick start" below), not `r.hydro.rri.py`.**
+This is the only current, real way to use this module. An earlier
+Python-script-plus-subprocess design (`r.hydro.rri.py`, shelling out to
+a standalone `rri_cpu` binary and writing ASCII `RRI_Input.txt`/grid
+files) has been retired now that this architecture covers everything it
+did and more -- see `NATIVE_GRASS_PLAN.md` section 7 for that history.
+`engine/`'s vendored *source* is still here (it's what `main.c` actually
+compiles against, and its own build remains available to regenerate an
+independent ASCII-engine binary this project's test suite cross-checks
+against -- see "Validation" below), but it is no longer a live runtime
+dependency the way it was in that earlier design.
 
 ## Status (NATIVE_GRASS_PLAN.md "Progress", summarized)
 
 | Increment | What | Status |
 |---|---|---|
-| 1 | Static input (elevation/drainage/accumulation) + index setting | Done, validated bit-for-bit against the old ASCII path |
+| 1 | Static input (elevation/drainage/accumulation) + index setting | Done, validated bit-for-bit against the ASCII reference |
 | 2 | Single-raster (`rain=`) forcing read/index | Done, validated |
 | 3 | STRDS (`rain_strds=`) forcing time-series resolution | Done, validated |
 | 4 | Adaptive RK45 time loop (the physics core) | Done, validated to 6+ sig figs against the ASCII engine, 24h stability run |
@@ -42,24 +40,27 @@ module (see "Quick start" below), not `r.hydro.rri.py`.**
 | 6 | `r.watershed.opencl` auto-invocation when `drainage=`/`accumulation=` omitted | Done, validated |
 | 7 | Pixel-based LULC (`landuse=`, per-class parameters) | Done (static raster only), validated |
 | 8 | `rain_units=` (mm/day default, matching `t.in.era5`) | Done, validated |
+| 9 | Retire `r.hydro.rri.py` / old architecture | Done |
 | -- | `landuse_strds=` (time-varying land use) | Not implemented -- see "Known gaps" |
-| -- | Retire `r.hydro.rri.py`/`engine/` | Not done -- kept as the cross-check reference for now |
 | -- | Groundwater, dams, diversions, boundary conditions, custom cross-sections | Not implemented (matches the vendored engine's own scope) |
 
 ## Quick start
 
-```sh
-# Build (ad hoc, until the Makefile switches to Module.make -- see below)
-export PATH="/usr/local/bin:$PATH"    # or wherever `grass` actually is
-gcc -std=c11 -O2 \
-    -I "$(grass --config path)/include" -I rri_include \
-    main.c rri_setup.c rri_geo.c rri_riv.c rri_slope.c rri_rivslo.c rri_infilt.c rri_rk.c \
-    -L "$(grass --config path)/lib" -lgrass_gis.8.6 -lgrass_raster.8.6 -lm \
-    -Wl,-rpath,"$(grass --config path)/lib" \
-    -o r_hydro_rri_native
+**Install** (either works; both build the same `main.c`):
 
-# Run (inside a GRASS session, region already set to your DEM):
-./r_hydro_rri_native elevation=dem rain_strds=era5_precipitation \
+```sh
+# Via g.extension (installs into $GRASS_ADDON_BASE, verified end-to-end
+# with a clean `g.extension extension=r.hydro.rri url=$HOME/dev/r.hydro.rri`):
+g.extension extension=r.hydro.rri url=$HOME/dev/r.hydro.rri
+
+# Or directly via make, from this directory, into a GRASS source tree:
+make MODULE_TOPDIR=$HOME/dev/grass
+```
+
+**Run** (inside a GRASS session, region already set to your DEM):
+
+```sh
+r.hydro.rri elevation=dem rain_strds=era5_precipitation \
     lasth=240 -r hydrograph_table=my_hydrograph hs_output=my_hs_strds
 ```
 
@@ -72,7 +73,7 @@ gcc -std=c11 -O2 \
 t.in.era5 variables=precipitation start=2026-01-01 end=2026-01-10 \
     output_prefix=era5
 
-./r_hydro_rri_native elevation=dem rain_strds=era5_precipitation \
+r.hydro.rri elevation=dem rain_strds=era5_precipitation \
     lasth=240 -r hydrograph_table=my_hydrograph
 ```
 
@@ -180,7 +181,7 @@ r.reclass input=some_lulc_raw output=landuse_3class rules=- << 'EOF'
 * = 1
 EOF
 
-./r_hydro_rri_native elevation=dem rain_strds=era5_precipitation \
+r.hydro.rri elevation=dem rain_strds=era5_precipitation \
     landuse=landuse_3class \
     ns_slope=0.4,0.15,0.02 soildepth=1.2,0.8,0.1 gammaa=0.5,0.45,0.3 \
     lasth=240 -r hydrograph_table=my_hydrograph
@@ -232,11 +233,6 @@ would be a natural improvement, not done this pass.
 * **River geometry** always comes from RRI's internal power-law estimate
   (`width_param_*`/`depth_param_*`) from flow accumulation -- supplying
   measured channel width/depth/height directly is not exposed.
-* **`r.hydro.rri.py`/`engine/` are not retired yet** despite being fully
-  superseded in scope by the native `main.c` path -- kept only as the
-  cross-check reference; see `NATIVE_GRASS_PLAN.md` section 7 for why
-  this is flagged as a real "should not persist" state, not the intended
-  end architecture.
 
 None of these are silent -- every one fails loudly or is documented,
 following this user's standing GRASS convention of failing loudly rather

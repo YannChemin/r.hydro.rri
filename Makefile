@@ -1,29 +1,26 @@
+MODULE_TOPDIR = ../..
+
 PGM = r.hydro.rri
 
-include $(MODULE_TOPDIR)/include/Make/Script.make
+LIBES = $(GISLIB) $(RASTERLIB) $(MATHLIB)
+DEPENDENCIES = $(GISDEP) $(RASTERDEP)
+EXTRA_INC = -Irri_include
 
-default: script engine
+# main.c + the physics-core sources reused unchanged from the vendored
+# RRI.opencl copy (engine/, see engine/VENDORED.md) -- rri_setup.c,
+# rri_geo.c, rri_riv.c, rri_slope.c, rri_rivslo.c, rri_infilt.c, rri_rk.c
+# are symlinks into engine/src/, picked up by Module.make's normal *.c
+# auto-discovery in this directory; rri_include/rri is a symlink to
+# engine/include/rri for the same reason. engine/'s own CMake build
+# (engine/build/rri_cpu, the now-retired ASCII/subprocess architecture's
+# binary) is NOT built by this Makefile -- it is no longer a runtime
+# dependency of this addon. It remains buildable manually, for this
+# project's own test suite to cross-check the native module's numbers
+# against (see tests/ascii_reference.py and README.md "Validation") --
+# see NATIVE_GRASS_PLAN.md section 7 for the full history of why engine/
+# is still here as a vendored source reference despite the subprocess
+# architecture it originally existed to support being retired.
 
-# Builds the vendored RRI.opencl engine (engine/, a frozen copy -- see
-# engine/VENDORED.md for provenance/validation status) with CMake, and
-# installs the resulting rri_cpu/rri_cl binaries plus the two OpenCL
-# kernel-source files they read at runtime (kernels.h, rri_kernels.cl --
-# see engine/src/rri_opencl.c's RRI_ENGINE_SHARE_DIR handling for why
-# those two travel with the binary rather than staying baked to the
-# build directory) into $(ETC)/$(PGM)/bin/. Module.make's own ETCFILES
-# mechanism only handles plain data files copied verbatim, not a
-# CMake build step, so this is a custom rule -- same idea as
-# r.hydro.hbv's own install-data rule for its bundled CSVs, but building
-# (not just copying) a compiled component. $(ETC)/$(PGM) is picked up
-# automatically by Script.make's own `install:` rule
-# (`cp -RL $(ETC)/$(PGM) $(INST_DIR)/etc/`), so nothing else has to
-# change for `g.extension`/`make install` to ship it.
-engine:
-	cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
-	cmake --build engine/build -j
-	$(MKDIR) $(ETC)/$(PGM)/bin
-	$(INSTALL) engine/build/rri_cpu $(ETC)/$(PGM)/bin/
-	$(INSTALL_DATA) engine/include/rri/kernels.h $(ETC)/$(PGM)/bin/
-	$(INSTALL_DATA) engine/cl/rri_kernels.cl $(ETC)/$(PGM)/bin/
+include $(MODULE_TOPDIR)/include/Make/Module.make
 
-.PHONY: engine
+default: cmd

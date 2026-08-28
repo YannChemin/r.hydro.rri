@@ -126,24 +126,17 @@ def test_rk45_loop_matches_ascii_engine_on_synthetic_domain(session, native_bina
     assert result.returncode == 0, result.stdout + result.stderr
     native = _parse_storage_line(result.stdout + result.stderr)
 
-    # -- old ASCII-path engine, same domain, matching rain_units so both
-    # see the identical 10 mm/h intensity (the *_test rasters above are
-    # already mm/h; rain_units=mm_per_hour tells the ASCII writer not to
-    # apply t.in.era5's mm/day->mm/h /24 default conversion) --
+    # -- old ASCII-path engine (vendored, kept only for this cross-check
+    # -- see tests/ascii_reference.py), same domain, same 10 mm/h --
+    from ascii_reference import write_reference_project
+
     project_dir = str(tmp_path / "ascii_xcheck")
-    old_driver = os.path.join(MODULE_DIR, "r.hydro.rri.py")
-    result = subprocess.run(
-        [
-            "python3", old_driver,
-            "elevation=dem_rk45_xcheck",
-            "rain_strds=" + _register_single_day_strds(session, tools),
-            "rain_units=mm_per_hour",
-            f"project_dir={project_dir}",
-            "lasth=1", "dt=600", "dt_riv=60", "riv_thresh=5",
-        ],
-        env=session.env, capture_output=True, text=True,
+    write_reference_project(
+        tools, session, project_dir,
+        elevation="dem_rk45_xcheck", accumulation="acc_rk45_xcheck",
+        direction="drain_rk45_xcheck", rain_mm_per_hour=10.0,
+        lasth=1, dt=600, dt_riv=60, riv_thresh=5,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
 
     result = subprocess.run([ENGINE_BIN, project_dir + os.sep], capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -166,18 +159,3 @@ def test_rk45_loop_matches_ascii_engine_on_synthetic_domain(session, native_bina
     # absolute fraction of rain_sum instead of relative to itself.
     assert abs(native["balance"]) / ascii_rain_sum < 1e-6
     assert abs(ascii_balance) / ascii_rain_sum < 1e-6
-
-
-def _register_single_day_strds(session, tools):
-    tools.t_create(
-        output="rain_rk45_xcheck_strds", type="strds", temporaltype="absolute",
-        title="x", description="x", overwrite=True,
-    )
-    register_file = gs.tempfile(env=session.env)
-    with open(register_file, "w") as f:
-        f.write("rain_rk45_xcheck|2026-01-01|2026-01-02")
-    gs.run_command(
-        "t.register", input="rain_rk45_xcheck_strds", type="raster",
-        file=register_file, env=session.env,
-    )
-    return "rain_rk45_xcheck_strds"
