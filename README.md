@@ -241,10 +241,10 @@ than silently guessing.
 ## Validation
 
 See `NATIVE_GRASS_PLAN.md` "Progress" for the full increment-by-increment
-validation writeup (each one checked against either the old ASCII
-engine's own output on an identical synthetic domain, or a physically
-checkable diagnostic, before the next increment began). Run the full
-suite:
+validation writeup (each one checked against either an independent ASCII
+reference engine's output on an identical synthetic domain, or a
+physically checkable diagnostic, before the next increment began). Run
+the full suite:
 
 ```sh
 export PATH="/usr/local/bin:$PATH"
@@ -255,7 +255,7 @@ python3 -m pytest tests/ -v
 ```
 
 15 tests as of this writing, all passing, covering: index-setting
-bit-for-bit agreement with the ASCII path; forcing read/index/STRDS
+bit-for-bit agreement with the ASCII reference; forcing read/index/STRDS
 resolution correctness; the RK45 loop's mass balance and 6+ significant
 figure agreement with the ASCII engine; a 24h stability run; GRASS-native
 output correctness (including a real cross-checked finding -- the tiny
@@ -265,21 +265,26 @@ auto-invocation and cleanup; `rain_units=` conversion correctness; and
 LULC per-class parameterization actually changing routing physics
 differently per class (not just accepted syntactically).
 
-## Install / development layout (old architecture -- see status above)
-
-The rest of this section describes `r.hydro.rri.py`'s installation as a
-GRASS script addon, kept for reference while it's still present:
-
-```sh
-ln -s $HOME/dev/r.hydro.rri $HOME/dev/grass-addons/src/raster/r.hydro.rri
-make MODULE_TOPDIR=$HOME/dev/grass
-```
-
-Running the vendored `engine/build/rri_cpu` binary (used by
-`r.hydro.rri.py` and by the native path's own cross-check tests) requires
-building it once:
+Some of these tests (`tests/ascii_reference.py`-based cross-checks) build
+and run the ASCII reference engine (`engine/build/rri_cpu`) for
+comparison -- a one-time build, not needed to use `r.hydro.rri` itself:
 
 ```sh
 cd $HOME/dev/r.hydro.rri && cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
 cmake --build engine/build -j
+```
+
+Tests referencing it skip themselves (rather than failing) if it hasn't
+been built.
+
+## Development layout
+
+Standalone at `$HOME/dev/r.hydro.rri` (this directory); symlink into
+`$HOME/dev/grass-addons/src/raster/r.hydro.rri` to build via the addon
+tree, following this user's established convention for `r.hydro.hbv`/
+`r.hydro.hbv.basins`/`r.hydro.hbv.forcing`/`r.watershed.opencl` (all in
+the same `grass-addons/src/raster/` directory):
+
+```sh
+ln -s $HOME/dev/r.hydro.rri $HOME/dev/grass-addons/src/raster/r.hydro.rri
 ```

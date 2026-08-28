@@ -5,3 +5,5 @@ OBJ.*/
 *.tmp.html
 .pytest_cache/
 .hypothesis/
+engine/build/
+r_hydro_rri_native

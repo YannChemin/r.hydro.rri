@@ -1,11 +1,16 @@
 # r.hydro.rri: native-GRASS rewrite plan
 
-Status: **Increment 1 (static input + index setting) implemented and
-validated on both a synthetic domain and the real dem_jamuna DEM.** See
-"Progress" at the bottom for exactly what that means, what's next, and a
-real data-quality issue increment 1's own consistency checking surfaced
-on real data. The rest of this document below "Progress" is still the
-original design (§1-7), left as written since nothing in it turned out
+Status: **Complete and the current architecture.** All 9 increments
+(static input + index setting, single-raster and STRDS forcing, the
+adaptive RK45 physics loop, GRASS-native output, `r.watershed.opencl`
+integration, pixel-based LULC, ERA5-aware `rain_units=`, and retiring
+the old ASCII/subprocess architecture) are implemented and validated --
+see "Progress" below for the full increment-by-increment writeup,
+including two real bugs found and fixed via cross-checking, a
+cross-validated (not assumed) domain-artifact finding, and the final
+clean `g.extension` install verification. The rest of this document
+below "Progress" is the original design (§1-7), left as written since
+nothing in it turned out
 to be wrong once implementation started.
 
 ## Progress
@@ -414,30 +419,51 @@ existing, validated addon -- integrate with it as an addon-to-addon
 dependency (its `direction=`/`accumulation=`-equivalent outputs consumed
 as this module's own `direction=`/`accumulation=` inputs), not vendored.
 
-## 7. What happens to the existing code in this directory
+## 7. What happened to the old architecture (RESOLVED)
 
-As of this plan being written, `r.hydro.rri.py` (subprocess-based
-driver), `engine/` (vendored `RRI.opencl` copy + the CMake-in-Makefile
-build hook), and the associated `tests/`/docs describe the
-now-superseded ASCII/subprocess architecture. They are **left in place,
-not deleted**, because:
+**Retired.** `r.hydro.rri.py` (the subprocess-based driver) and the
+Makefile's `engine:` build/install hook for `engine/build/rri_cpu` as a
+runtime dependency have been removed, once increments 1-8 above gave the
+native `main.c` path full coverage of what the old driver did (and more:
+the RK45 loop, GRASS-native output, LULC, and `r.watershed.opencl`
+integration were all things the old driver either lacked or only
+half-had via the vendored engine's own, separately-invoked binary).
 
-- `engine/`'s physics-core files (§1's "reusable unchanged" rows) are
-  exactly the source this rewrite reuses -- deleting them would just
-  mean re-copying them from `RRI.opencl` again.
-- `r.hydro.rri.py`'s reverse-engineered format/behavior knowledge (the
-  `r.watershed` direction-convention reclass table, the outlet
-  auto-detection heuristic, the rain-unit-conversion logic, the config
-  field defaults) is directly reusable *design* even though the
-  mechanism (write-ASCII-then-shell-out) is being replaced -- it is
-  useful prior art for `io_grass.c`'s design, not dead weight.
-- Nothing in this plan has been implemented yet against these files, so
-  there is nothing working to break by leaving them as reference.
+**Kept**: `engine/`'s vendored *source* (`src/`, `include/`, `cl/`,
+`CMakeLists.txt`, `VENDORED.md`) -- for two reasons, both live, not
+historical:
 
-**This state should not persist past the next implementation pass**:
-either the native module supersedes and this directory's root-level
-Python driver + `engine/`'s Makefile hook are removed once the C module
-does the same job, or (if a hybrid is ever deliberately chosen) that
-decision gets documented explicitly rather than left as accidental
-leftover clutter. Flagging this explicitly so it isn't mistaken for the
-current, intended architecture by a future reader.
+1. It is where `main.c`'s reused physics-core files (`rri_setup.c`,
+   `rri_riv.c`, `rri_slope.c`, `rri_rivslo.c`, `rri_infilt.c`, `rri_rk.c`,
+   `include/rri/{rri.h,kernels.h}`) actually live on disk -- the module
+   root's own copies of these are symlinks into `engine/src/`/
+   `engine/include/rri/` (`ln -s engine/src/rri_riv.c rri_riv.c`, etc.),
+   picked up by `Module.make`'s ordinary `*.c` auto-discovery in the
+   module's own directory. Deleting `engine/` would break the build.
+2. Its own CMake build remains available, on demand (not as part of
+   installing this addon), to regenerate an independent ASCII-engine
+   binary (`engine/build/rri_cpu`) that this project's test suite
+   (`tests/ascii_reference.py` + the tests that use it) cross-checks the
+   native module's numbers against -- the same validation role it always
+   had, just no longer wired into the addon's own install path.
+
+**The Makefile now only builds the one real thing**: `Module.make`,
+`PGM = r.hydro.rri`, compiling `main.c` + the symlinked physics-core
+files above, linking `$(GISLIB) $(RASTERLIB) $(MATHLIB)`. No CMake
+invocation, no `engine:` target, nothing installed under `$(ETC)`.
+
+**Verified, not assumed**: a clean `g.extension extension=r.hydro.rri
+url=$HOME/dev/r.hydro.rri` (local-directory source, `shutil.copytree` --
+confirmed by reading `g.extension.py`'s own `source == "dir"` branch,
+which is what a local `url=` path actually triggers, not a git clone)
+completed successfully end to end -- "Installation of <r.hydro.rri>
+successfully finished" -- and the resulting installed binary
+(`~/.grass8/addons/bin/r.hydro.rri`) ran correctly against the synthetic
+domain (`riv_count=16 slo_count=100`, matching every prior increment's
+number on that same domain). Full test suite re-run after the cleanup:
+15/15 passing, with the two ASCII cross-check tests rewritten to build
+their reference project inline (`tests/ascii_reference.py`) instead of
+shelling out to the now-deleted `r.hydro.rri.py`, and the old driver's
+own dedicated test file (`tests/r_hydro_rri_test.py`, which tested
+`r.hydro.rri.py` directly) removed since there is nothing left for it to
+test.
